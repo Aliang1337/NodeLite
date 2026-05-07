@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
-use ximonitor_proto::{NodeIdentity, NodeSnapshot, NodeStatus, ServerConfig};
+use ximonitor_proto::{NodeIdentity, NodeSnapshot, NodeStatus, OverviewData, ServerConfig};
 
 #[derive(Clone)]
 pub struct SharedState {
@@ -76,6 +76,16 @@ impl SharedState {
     pub async fn list_statuses(&self) -> Vec<NodeStatus> {
         let registry = self.registry.read().await;
         registry.list_statuses()
+    }
+
+    pub async fn get_status(&self, node_id: &str) -> Option<NodeStatus> {
+        let registry = self.registry.read().await;
+        registry.get_status(node_id)
+    }
+
+    pub async fn overview(&self) -> OverviewData {
+        let registry = self.registry.read().await;
+        registry.overview()
     }
 }
 
@@ -201,6 +211,57 @@ impl Registry {
                 .then_with(|| left.identity.node_id.cmp(&right.identity.node_id))
         });
         statuses
+    }
+
+    fn get_status(&self, node_id: &str) -> Option<NodeStatus> {
+        self.nodes.get(node_id).map(|entry| entry.status.clone())
+    }
+
+    fn overview(&self) -> OverviewData {
+        let statuses = self.list_statuses();
+        let total_nodes = statuses.len();
+        let online_nodes = statuses.iter().filter(|status| status.online).count();
+        let offline_nodes = total_nodes.saturating_sub(online_nodes);
+        let total_rx_bytes = statuses
+            .iter()
+            .filter_map(|status| status.snapshot.as_ref())
+            .map(|snapshot| snapshot.network.total_rx_bytes)
+            .sum();
+        let total_tx_bytes = statuses
+            .iter()
+            .filter_map(|status| status.snapshot.as_ref())
+            .map(|snapshot| snapshot.network.total_tx_bytes)
+            .sum();
+        let current_rx_bytes_per_sec = statuses
+            .iter()
+            .filter_map(|status| status.snapshot.as_ref())
+            .filter_map(|snapshot| snapshot.network.rx_bytes_per_sec)
+            .sum();
+        let current_tx_bytes_per_sec = statuses
+            .iter()
+            .filter_map(|status| status.snapshot.as_ref())
+            .filter_map(|snapshot| snapshot.network.tx_bytes_per_sec)
+            .sum();
+
+        let latencies: Vec<u64> = statuses
+            .iter()
+            .filter(|status| status.online)
+            .filter_map(|status| status.latency_ms)
+            .collect();
+        let average_latency_ms = (!latencies.is_empty())
+            .then(|| latencies.iter().copied().sum::<u64>() as f64 / latencies.len() as f64);
+
+        OverviewData {
+            generated_at: Utc::now(),
+            total_nodes,
+            online_nodes,
+            offline_nodes,
+            total_rx_bytes,
+            total_tx_bytes,
+            current_rx_bytes_per_sec,
+            current_tx_bytes_per_sec,
+            average_latency_ms,
+        }
     }
 }
 

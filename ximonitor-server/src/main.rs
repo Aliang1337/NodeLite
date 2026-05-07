@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use clap::Parser;
@@ -87,6 +87,9 @@ async fn main() -> Result<()> {
         .route("/nodes/:node_id", get(node_detail))
         .route("/healthz", get(healthz))
         .route("/api/bootstrap", get(bootstrap))
+        .route("/api/overview", get(overview))
+        .route("/api/nodes", get(nodes))
+        .route("/api/nodes/:node_id", get(node_status))
         .route("/ws", get(ws_handler))
         .with_state(state)
         .layer(TraceLayer::new_for_http());
@@ -210,6 +213,24 @@ async fn bootstrap(State(state): State<AppState>) -> impl IntoResponse {
         refresh_interval_secs: state.shared.config().refresh_interval_secs,
         registered_nodes: state.shared.node_count().await,
     })
+}
+
+async fn overview(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.shared.overview().await)
+}
+
+async fn nodes(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.shared.list_statuses().await)
+}
+
+async fn node_status(
+    State(state): State<AppState>,
+    AxumPath(node_id): AxumPath<String>,
+) -> Response {
+    match state.shared.get_status(&node_id).await {
+        Some(status) => Json(status).into_response(),
+        None => (StatusCode::NOT_FOUND, "node not found").into_response(),
+    }
 }
 
 async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
