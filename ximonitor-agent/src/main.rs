@@ -8,9 +8,10 @@ use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use tokio::fs;
 use tokio::time::interval;
+use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::info;
+use tracing::{info, warn};
 use ximonitor_proto::{
     AgentConfig, HelloMessage, MetricsMessage, NoticeLevel, PingMessage, PongMessage,
     ServerNoticeMessage, WireMessage, parse_agent_config,
@@ -56,7 +57,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    run_session(config, collector, identity).await
+    run_forever(config, collector, identity).await
 }
 
 async fn load_agent_config(path: &Path) -> Result<AgentConfig> {
@@ -78,10 +79,37 @@ fn init_tracing() {
         .init();
 }
 
-async fn run_session(
+async fn run_forever(
     config: AgentConfig,
     mut collector: crate::collector::HostCollector,
     identity: ximonitor_proto::NodeIdentity,
+) -> Result<()> {
+    let mut attempt = 0_u32;
+
+    loop {
+        match run_session(&config, &mut collector, &identity).await {
+            Ok(()) => {
+                attempt = 0;
+            }
+            Err(error) => {
+                let delay = reconnect_delay(attempt);
+                warn!(
+                    server = %config.server,
+                    delay_secs = delay.as_secs(),
+                    error = ?error,
+                    "agent session ended; retrying after backoff"
+                );
+                sleep(delay).await;
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
+}
+
+async fn run_session(
+    config: &AgentConfig,
+    collector: &mut crate::collector::HostCollector,
+    identity: &ximonitor_proto::NodeIdentity,
 ) -> Result<()> {
     let (socket, _) = connect_async(config.server.as_str())
         .await
@@ -92,19 +120,19 @@ async fn run_session(
         &mut sender,
         &WireMessage::Hello(HelloMessage {
             token: config.token.clone(),
-            identity,
+            identity: identity.clone(),
         }),
     )
     .await?;
 
-    send_metrics(&mut sender, &mut collector).await?;
+    send_metrics(&mut sender, collector).await?;
 
     let mut report_ticker = interval(Duration::from_secs(config.report_interval_secs));
 
     loop {
         tokio::select! {
             _ = report_ticker.tick() => {
-                send_metrics(&mut sender, &mut collector).await?;
+                send_metrics(&mut sender, collector).await?;
             }
             incoming = receiver.next() => {
                 let Some(frame) = incoming else {
@@ -177,4 +205,17 @@ fn log_notice(level: NoticeLevel, message: &str) {
         NoticeLevel::Warn => tracing::warn!(message = %message, "server notice"),
         NoticeLevel::Error => tracing::error!(message = %message, "server notice"),
     }
+}
+
+fn reconnect_delay(attempt: u32) -> Duration {
+    let seconds = match attempt {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        3 => 8,
+        4 => 16,
+        5 => 32,
+        _ => 60,
+    };
+    Duration::from_secs(seconds)
 }
