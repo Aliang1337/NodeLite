@@ -95,13 +95,13 @@ async fn main() -> Result<()> {
     let state = AppState { history, shared };
     let app = Router::new()
         .route("/", get(index))
-        .route("/nodes/:node_id", get(node_detail))
+        .route("/nodes/{node_id}", get(node_detail))
         .route("/healthz", get(healthz))
         .route("/api/bootstrap", get(bootstrap))
         .route("/api/overview", get(overview))
         .route("/api/nodes", get(nodes))
-        .route("/api/nodes/:node_id", get(node_status))
-        .route("/api/nodes/:node_id/history", get(node_history))
+        .route("/api/nodes/{node_id}", get(node_status))
+        .route("/api/nodes/{node_id}/history", get(node_history))
         .route("/ws", get(ws_handler))
         .with_state(state)
         .layer(TraceLayer::new_for_http());
@@ -442,4 +442,57 @@ fn init_tracing() {
         .with_target(false)
         .compact()
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::path::PathBuf;
+
+    use axum::Router;
+
+    use super::{
+        AppState, bootstrap, healthz, index, node_detail, node_history, node_status, nodes,
+        overview, ws_handler,
+    };
+    use crate::history::HistoryStore;
+    use crate::state::SharedState;
+    use axum::routing::get;
+    use tower_http::trace::TraceLayer;
+    use ximonitor_proto::ServerConfig;
+
+    #[test]
+    fn router_builds_with_v08_path_syntax() {
+        let config = Arc::new(ServerConfig {
+            listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080)),
+            public_base_url: "http://127.0.0.1:8080".to_string(),
+            shared_token: "token".to_string(),
+            history_db_path: PathBuf::from("./data/history.sqlite3"),
+            snapshot_path: PathBuf::from("./data/snapshot.json"),
+            stale_after_secs: 20,
+            ping_interval_secs: 10,
+            max_message_bytes: 65536,
+            refresh_interval_secs: 5,
+            ignored_filesystems: vec!["tmpfs".to_string()],
+        });
+        let state = AppState {
+            history: HistoryStore::new(PathBuf::from("./data/history.sqlite3")),
+            shared: SharedState::new(config),
+        };
+
+        let _app: Router = Router::new()
+            .route("/", get(index))
+            .route("/nodes/{node_id}", get(node_detail))
+            .route("/healthz", get(healthz))
+            .route("/api/bootstrap", get(bootstrap))
+            .route("/api/overview", get(overview))
+            .route("/api/nodes", get(nodes))
+            .route("/api/nodes/{node_id}", get(node_status))
+            .route("/api/nodes/{node_id}/history", get(node_history))
+            .route("/ws", get(ws_handler))
+            .with_state(state)
+            .layer(TraceLayer::new_for_http());
+    }
 }

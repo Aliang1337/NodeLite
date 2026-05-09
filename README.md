@@ -13,12 +13,12 @@ XiMonitor 是一个用 Rust 编写的轻量级服务器监控面板，包含：
 
 - 服务端只读页面：
   - `/`
-  - `/nodes/:node_id`
+  - `/nodes/{node_id}`
 - 服务端只读 API：
   - `/api/overview`
   - `/api/nodes`
-  - `/api/nodes/:node_id`
-  - `/api/nodes/:node_id/history`
+  - `/api/nodes/{node_id}`
+  - `/api/nodes/{node_id}/history`
 - agent 接入协议：
   - `hello`
   - `metrics`
