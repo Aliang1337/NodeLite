@@ -32,6 +32,7 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
+    install_rustls_crypto_provider()?;
 
     let cli = Cli::parse();
     let config = load_agent_config(&cli.config).await?;
@@ -58,6 +59,12 @@ async fn main() -> Result<()> {
     }
 
     run_forever(config, collector, identity).await
+}
+
+fn install_rustls_crypto_provider() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow!("failed to install rustls crypto provider"))
 }
 
 async fn load_agent_config(path: &Path) -> Result<AgentConfig> {
