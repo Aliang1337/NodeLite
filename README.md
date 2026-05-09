@@ -234,6 +234,14 @@ server {
 
 如果你需要轮换某个节点 token，可以追加 `--rotate-token`。
 
+如果你只想给已经安装过的 agent 打印一条升级命令，不需要节点参数，可以直接在服务端执行：
+
+```bash
+/usr/local/bin/ximonitor-server \
+  --config /opt/ximonitor/config/server.toml \
+  upgrade-agent
+```
+
 ## 一键安装
 
 服务端 `install-agent` 打印出来的命令大概长这样：
@@ -254,6 +262,7 @@ curl -fsSL https://monitor.example.com/install/install-agent.sh | \
 - 会创建 `ximonitor-agent` 专用系统用户，并以该用户运行 systemd service
 - 会写入 `/etc/ximonitor/agent.toml`，并将目录/文件权限收紧到仅 root 与该服务用户可读
 - 会生成 `ximonitor-agent.service`
+- 默认会启用 `ximonitor-agent-auto-update.timer`，每天自动检查并拉取最新 GitHub Release
 - 会执行 `daemon-reload`、`enable` 和 `restart`
 
 ### 子机安装步骤
@@ -295,8 +304,26 @@ curl -fsSL https://monitor.example.com/install/install-agent.sh | \
 - 重写并补齐 systemd service
 - 保留现有 `/etc/ximonitor/agent.toml`
 - 自动修正目录和文件权限
+- 默认保留并继续启用自动更新 timer
 
 如果你在升级时也传了 `--bootstrap-url` 和 install token，它会顺手刷新 agent 配置。
+
+如果你不想让 agent 自动更新，可以在安装或升级时显式关闭：
+
+```bash
+curl -fsSL https://monitor.example.com/install/install-agent.sh | \
+  XIMONITOR_AGENT_AUTO_UPDATE=disable sh -s -- \
+  --bootstrap-url https://monitor.example.com/install/bootstrap \
+  --install-token <one-time-token> \
+  --base-url https://github.com/XiNian-dada/XiMonitor/releases/latest/download
+```
+
+查看自动更新状态：
+
+```bash
+systemctl status ximonitor-agent-auto-update.timer
+systemctl list-timers --all | grep ximonitor-agent-auto-update
+```
 
 如果你已经有精确二进制地址，也可以继续使用自定义下载地址和校验文件：
 
@@ -352,6 +379,8 @@ cargo run -p ximonitor-agent -- --config config/agent.toml
 7. 上传 `install-server.sh` 和 `install-agent.sh`
 8. 上传 `SHA256SUMS.txt`
 9. 自动创建 GitHub Release
+
+GitHub Release 编译出来的 agent 会把对应 tag 版本号上报到面板里，所以面板里看到的 Agent 版本会是 `1.0.x` 这种发布版本，而不是固定的开发版本号。
 
 ## 说明
 
