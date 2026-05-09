@@ -181,8 +181,12 @@ resolve_release_base_url() {
         tolower($1) == "location:" {
           value = $2
           sub(/\r$/, "", value)
-          print value
-          exit
+          location = value
+        }
+        END {
+          if (location != "") {
+            print location
+          }
         }
       ')" \
         || fail "failed to resolve latest GitHub release"

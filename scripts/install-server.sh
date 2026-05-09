@@ -130,7 +130,7 @@ fetch_expected_sha256() {
   artifact_name="$1"
   checksums_url="$BASE_URL/SHA256SUMS.txt"
 
-  printf '%s\n' "Fetching release checksums from $checksums_url"
+  printf '%s\n' "Fetching release checksums from $checksums_url" >&2
   curl -fsSL "$checksums_url" -o "$TMP_SHA256" || fail "failed to fetch release checksums"
 
   expected_sha256="$(awk -v artifact="$artifact_name" '
@@ -157,8 +157,12 @@ resolve_release_base_url() {
         tolower($1) == "location:" {
           value = $2
           sub(/\r$/, "", value)
-          print value
-          exit
+          location = value
+        }
+        END {
+          if (location != "") {
+            print location
+          }
         }
       ')" \
         || fail "failed to resolve latest GitHub release"
