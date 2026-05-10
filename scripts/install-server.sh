@@ -68,21 +68,15 @@ prompt_required() {
   done
 }
 
-prompt_mode() {
-  default_value="$1"
-
-  while :; do
-    value="$(read_line "Operation mode (install/upgrade)" "$default_value")"
-    case "$value" in
-      install|upgrade)
-        printf '%s' "$value"
-        return 0
-        ;;
-      *)
-        printf '%s\n' "Please enter install or upgrade." >/dev/tty
-        ;;
-    esac
-  done
+validate_mode() {
+  case "$1" in
+    auto|install|upgrade|migrate)
+      return 0
+      ;;
+    *)
+      fail "operation mode must be auto, install, upgrade, or migrate"
+      ;;
+  esac
 }
 
 confirm_default_no() {
@@ -217,6 +211,17 @@ detect_existing_install_root() {
   printf '%s' ""
 }
 
+copy_tree_contents() {
+  source_dir="$1"
+  target_dir="$2"
+
+  [ -d "$source_dir" ] || return 0
+  mkdir -p "$target_dir"
+  if [ -n "$(find "$source_dir" -mindepth 1 -maxdepth 1 2>/dev/null)" ]; then
+    cp -R "$source_dir"/. "$target_dir"/
+  fi
+}
+
 toml_get_raw() {
   file="$1"
   section="$2"
@@ -255,15 +260,16 @@ strip_toml_string_quotes() {
 }
 
 load_existing_server_defaults() {
-  [ -f "$CONFIG_PATH" ] || return 0
+  config_path="$1"
+  [ -f "$config_path" ] || return 0
 
-  listen_value="$(strip_toml_string_quotes "$(toml_get_raw "$CONFIG_PATH" server listen)")"
+  listen_value="$(strip_toml_string_quotes "$(toml_get_raw "$config_path" server listen)")"
   if [ -n "$listen_value" ] && [ "$listen_value" != "${listen_value%:*}" ]; then
     LISTEN_HOST_DEFAULT_VALUE="${listen_value%:*}"
     LISTEN_PORT_DEFAULT_VALUE="${listen_value##*:}"
   fi
 
-  public_base_url="$(strip_toml_string_quotes "$(toml_get_raw "$CONFIG_PATH" server public_base_url)")"
+  public_base_url="$(strip_toml_string_quotes "$(toml_get_raw "$config_path" server public_base_url)")"
   case "$public_base_url" in
     http://*)
       PUBLIC_SCHEME_DEFAULT_VALUE="http"
@@ -275,34 +281,34 @@ load_existing_server_defaults() {
       ;;
   esac
 
-  readonly_username="$(strip_toml_string_quotes "$(toml_get_raw "$CONFIG_PATH" auth username)")"
+  readonly_username="$(strip_toml_string_quotes "$(toml_get_raw "$config_path" auth username)")"
   if [ -n "$readonly_username" ]; then
     READONLY_USERNAME_DEFAULT_VALUE="$readonly_username"
   fi
-  readonly_password="$(strip_toml_string_quotes "$(toml_get_raw "$CONFIG_PATH" auth password)")"
+  readonly_password="$(strip_toml_string_quotes "$(toml_get_raw "$config_path" auth password)")"
   if [ -n "$readonly_password" ]; then
     READONLY_PASSWORD_DEFAULT_VALUE="$readonly_password"
   fi
 
-  value="$(trim_whitespace "$(toml_get_raw "$CONFIG_PATH" server stale_after_secs)")"
+  value="$(trim_whitespace "$(toml_get_raw "$config_path" server stale_after_secs)")"
   [ -n "$value" ] && SERVER_STALE_AFTER_SECS="$value"
-  value="$(trim_whitespace "$(toml_get_raw "$CONFIG_PATH" server ping_interval_secs)")"
+  value="$(trim_whitespace "$(toml_get_raw "$config_path" server ping_interval_secs)")"
   [ -n "$value" ] && SERVER_PING_INTERVAL_SECS="$value"
-  value="$(trim_whitespace "$(toml_get_raw "$CONFIG_PATH" server max_message_bytes)")"
+  value="$(trim_whitespace "$(toml_get_raw "$config_path" server max_message_bytes)")"
   [ -n "$value" ] && SERVER_MAX_MESSAGE_BYTES="$value"
-  value="$(trim_whitespace "$(toml_get_raw "$CONFIG_PATH" ws max_total_connections)")"
+  value="$(trim_whitespace "$(toml_get_raw "$config_path" ws max_total_connections)")"
   [ -n "$value" ] && WS_MAX_TOTAL_CONNECTIONS="$value"
-  value="$(trim_whitespace "$(toml_get_raw "$CONFIG_PATH" ws max_connections_per_ip)")"
+  value="$(trim_whitespace "$(toml_get_raw "$config_path" ws max_connections_per_ip)")"
   [ -n "$value" ] && WS_MAX_CONNECTIONS_PER_IP="$value"
-  value="$(trim_whitespace "$(toml_get_raw "$CONFIG_PATH" ws auth_fail_window_secs)")"
+  value="$(trim_whitespace "$(toml_get_raw "$config_path" ws auth_fail_window_secs)")"
   [ -n "$value" ] && WS_AUTH_FAIL_WINDOW_SECS="$value"
-  value="$(trim_whitespace "$(toml_get_raw "$CONFIG_PATH" ws auth_fail_max_attempts)")"
+  value="$(trim_whitespace "$(toml_get_raw "$config_path" ws auth_fail_max_attempts)")"
   [ -n "$value" ] && WS_AUTH_FAIL_MAX_ATTEMPTS="$value"
-  value="$(trim_whitespace "$(toml_get_raw "$CONFIG_PATH" ws auth_block_secs)")"
+  value="$(trim_whitespace "$(toml_get_raw "$config_path" ws auth_block_secs)")"
   [ -n "$value" ] && WS_AUTH_BLOCK_SECS="$value"
-  value="$(trim_whitespace "$(toml_get_raw "$CONFIG_PATH" ui refresh_interval_secs)")"
+  value="$(trim_whitespace "$(toml_get_raw "$config_path" ui refresh_interval_secs)")"
   [ -n "$value" ] && UI_REFRESH_INTERVAL_SECS="$value"
-  value="$(trim_whitespace "$(toml_get_raw "$CONFIG_PATH" filters ignored_filesystems)")"
+  value="$(trim_whitespace "$(toml_get_raw "$config_path" filters ignored_filesystems)")"
   [ -n "$value" ] && IGNORED_FILESYSTEMS_RAW="$value"
 }
 
@@ -342,9 +348,11 @@ EOF
 need_cmd awk
 need_cmd chmod
 need_cmd chown
+need_cmd cp
 need_cmd curl
 need_cmd id
 need_cmd install
+need_cmd find
 need_cmd mkdir
 need_cmd mktemp
 need_cmd mv
@@ -361,20 +369,15 @@ printf '%s\n' "XiMonitor Server Installer" >/dev/tty
 printf '%s\n' "This script installs the latest XiMonitor server release from GitHub." >/dev/tty
 printf '\n' >/dev/tty
 
+validate_mode "$MODE"
+
 existing_install_root="$(detect_existing_install_root)"
 if [ -n "$existing_install_root" ]; then
   INSTALL_ROOT_DEFAULT="$existing_install_root"
 fi
 
-INSTALL_ROOT="$(prompt_required "Install root directory" "$INSTALL_ROOT_DEFAULT")"
-
-CONFIG_DIR="$INSTALL_ROOT/config"
-DATA_DIR="$INSTALL_ROOT/data"
-CONFIG_PATH="$CONFIG_DIR/server.toml"
-REGISTRY_PATH="$CONFIG_DIR/server.json"
-
 existing_install=0
-if [ -e "$CONFIG_PATH" ] || [ -e "$UNIT_PATH" ] || [ -e "$BIN_PATH" ]; then
+if [ -n "$existing_install_root" ] || [ -e "$UNIT_PATH" ] || [ -e "$BIN_PATH" ]; then
   existing_install=1
 fi
 
@@ -386,16 +389,23 @@ if [ "$MODE" = "auto" ]; then
   fi
 fi
 
-MODE="$(prompt_mode "$MODE")"
-
-if [ "$MODE" = "upgrade" ] && [ "$existing_install" -ne 1 ]; then
-  fail "upgrade mode requires an existing XiMonitor server installation"
+if [ "$MODE" = "upgrade" ] || [ "$MODE" = "migrate" ]; then
+  if [ "$existing_install" -ne 1 ]; then
+    fail "$MODE mode requires an existing XiMonitor server installation"
+  fi
+  if [ -z "$existing_install_root" ]; then
+    fail "failed to detect the current XiMonitor install root from the systemd unit"
+  fi
 fi
 
-if [ "$MODE" = "install" ] && [ "$existing_install" -eq 1 ]; then
-  if ! confirm_default_no "Existing XiMonitor files detected. Overwrite them?"; then
-    fail "aborted by user"
-  fi
+CURRENT_INSTALL_ROOT="$existing_install_root"
+CURRENT_CONFIG_PATH=""
+CURRENT_REGISTRY_PATH=""
+CURRENT_DATA_DIR=""
+if [ -n "$CURRENT_INSTALL_ROOT" ]; then
+  CURRENT_CONFIG_PATH="$CURRENT_INSTALL_ROOT/config/server.toml"
+  CURRENT_REGISTRY_PATH="$CURRENT_INSTALL_ROOT/config/server.json"
+  CURRENT_DATA_DIR="$CURRENT_INSTALL_ROOT/data"
 fi
 
 SERVER_STALE_AFTER_SECS="20"
@@ -416,21 +426,48 @@ PUBLIC_SCHEME_DEFAULT_VALUE="https"
 READONLY_USERNAME_DEFAULT_VALUE="viewer"
 READONLY_PASSWORD_DEFAULT_VALUE="$(random_hex 16)"
 
-if [ "$MODE" = "upgrade" ]; then
-  load_existing_server_defaults
+if [ "$MODE" = "upgrade" ] || [ "$MODE" = "migrate" ]; then
+  load_existing_server_defaults "$CURRENT_CONFIG_PATH"
 fi
 
-LISTEN_HOST="$(prompt_required "Listen host" "$LISTEN_HOST_DEFAULT_VALUE")"
-LISTEN_PORT="$(prompt_required "Listen port" "$LISTEN_PORT_DEFAULT_VALUE")"
-PUBLIC_HOST="$(prompt_required "Public domain or IP" "$PUBLIC_HOST_DEFAULT_VALUE")"
-PUBLIC_SCHEME="$(prompt_required "Public scheme" "$PUBLIC_SCHEME_DEFAULT_VALUE")"
-READONLY_USERNAME="$(prompt_required "Readonly username" "$READONLY_USERNAME_DEFAULT_VALUE")"
-READONLY_PASSWORD="$(prompt_required "Readonly password" "$READONLY_PASSWORD_DEFAULT_VALUE")"
+if [ "$MODE" = "upgrade" ]; then
+  INSTALL_ROOT="$CURRENT_INSTALL_ROOT"
+else
+  INSTALL_ROOT="$(prompt_required "Install root directory" "$INSTALL_ROOT_DEFAULT")"
+fi
 
-validate_port "$LISTEN_PORT"
-validate_scheme "$PUBLIC_SCHEME"
-validate_no_whitespace "install root directory" "$INSTALL_ROOT"
-validate_no_whitespace "public host" "$PUBLIC_HOST"
+CONFIG_DIR="$INSTALL_ROOT/config"
+DATA_DIR="$INSTALL_ROOT/data"
+CONFIG_PATH="$CONFIG_DIR/server.toml"
+REGISTRY_PATH="$CONFIG_DIR/server.json"
+
+if [ "$MODE" = "install" ] && [ "$existing_install" -eq 1 ]; then
+  if ! confirm_default_no "Existing XiMonitor files detected. Overwrite them?"; then
+    fail "aborted by user"
+  fi
+fi
+
+if [ "$MODE" = "upgrade" ]; then
+  [ -f "$CONFIG_PATH" ] || fail "existing server config not found at $CONFIG_PATH"
+  LISTEN_HOST="$LISTEN_HOST_DEFAULT_VALUE"
+  LISTEN_PORT="$LISTEN_PORT_DEFAULT_VALUE"
+  PUBLIC_HOST="$PUBLIC_HOST_DEFAULT_VALUE"
+  PUBLIC_SCHEME="$PUBLIC_SCHEME_DEFAULT_VALUE"
+  READONLY_USERNAME="$READONLY_USERNAME_DEFAULT_VALUE"
+  READONLY_PASSWORD="$READONLY_PASSWORD_DEFAULT_VALUE"
+else
+  LISTEN_HOST="$(prompt_required "Listen host" "$LISTEN_HOST_DEFAULT_VALUE")"
+  LISTEN_PORT="$(prompt_required "Listen port" "$LISTEN_PORT_DEFAULT_VALUE")"
+  PUBLIC_HOST="$(prompt_required "Public domain or IP" "$PUBLIC_HOST_DEFAULT_VALUE")"
+  PUBLIC_SCHEME="$(prompt_required "Public scheme" "$PUBLIC_SCHEME_DEFAULT_VALUE")"
+  READONLY_USERNAME="$(prompt_required "Readonly username" "$READONLY_USERNAME_DEFAULT_VALUE")"
+  READONLY_PASSWORD="$(prompt_required "Readonly password" "$READONLY_PASSWORD_DEFAULT_VALUE")"
+
+  validate_port "$LISTEN_PORT"
+  validate_scheme "$PUBLIC_SCHEME"
+  validate_no_whitespace "install root directory" "$INSTALL_ROOT"
+  validate_no_whitespace "public host" "$PUBLIC_HOST"
+fi
 
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -465,13 +502,23 @@ ACTUAL_SHA256="$(calculate_sha256 "$TMP_BIN")"
 [ "$ACTUAL_SHA256" = "$EXPECTED_SHA256" ] || fail "downloaded server checksum mismatch"
 
 install -o root -g root -m 0755 "$TMP_BIN" "$BIN_PATH"
-render_server_config >"$CONFIG_PATH"
-chmod 0600 "$CONFIG_PATH"
 
-if [ ! -f "$REGISTRY_PATH" ]; then
-  printf '%s\n' '{"nodes":[],"install_sessions":[]}' >"$REGISTRY_PATH"
+if [ "$MODE" = "migrate" ] && [ "$CURRENT_INSTALL_ROOT" != "$INSTALL_ROOT" ]; then
+  copy_tree_contents "$CURRENT_DATA_DIR" "$DATA_DIR"
+  if [ -f "$CURRENT_REGISTRY_PATH" ]; then
+    cp "$CURRENT_REGISTRY_PATH" "$REGISTRY_PATH"
+  fi
 fi
-chmod 0600 "$REGISTRY_PATH"
+
+if [ "$MODE" != "upgrade" ]; then
+  render_server_config >"$CONFIG_PATH"
+  chmod 0600 "$CONFIG_PATH"
+
+  if [ ! -f "$REGISTRY_PATH" ]; then
+    printf '%s\n' '{"nodes":[],"install_sessions":[]}' >"$REGISTRY_PATH"
+  fi
+  chmod 0600 "$REGISTRY_PATH"
+fi
 
 cat >"$UNIT_PATH" <<EOF
 [Unit]
@@ -504,6 +551,8 @@ systemctl restart "$SERVICE_NAME.service"
 clear_screen
 if [ "$MODE" = "upgrade" ]; then
   printf '%s\n' "XiMonitor server upgraded and restarted." >/dev/tty
+elif [ "$MODE" = "migrate" ]; then
+  printf '%s\n' "XiMonitor server migrated, upgraded, and restarted." >/dev/tty
 else
   printf '%s\n' "XiMonitor server installed and started." >/dev/tty
 fi
