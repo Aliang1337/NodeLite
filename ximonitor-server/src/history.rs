@@ -334,8 +334,14 @@ fn open_database_connection(db_path: &PathBuf, enable_wal: bool) -> Result<Conne
 
 fn build_history_point(status: &NodeStatus) -> Option<HistoryPoint> {
     let snapshot = status.snapshot.as_ref()?;
-    let total_disk_bytes: u64 = snapshot.disks.iter().map(|disk| disk.total_bytes).sum();
-    let used_disk_bytes: u64 = snapshot.disks.iter().map(|disk| disk.used_bytes).sum();
+    let total_disk_bytes = snapshot
+        .disks
+        .iter()
+        .fold(0_u64, |total, disk| total.saturating_add(disk.total_bytes));
+    let used_disk_bytes = snapshot
+        .disks
+        .iter()
+        .fold(0_u64, |total, disk| total.saturating_add(disk.used_bytes));
     let disk_used_percent =
         (total_disk_bytes > 0).then(|| percentage(used_disk_bytes, total_disk_bytes));
     let recorded_at = status.last_seen.unwrap_or_else(Utc::now);

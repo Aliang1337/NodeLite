@@ -33,8 +33,9 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use url::Url;
 use ximonitor_proto::{
-    HelloMessage, MetricsMessage, NodeSnapshot, PingMessage, PongMessage, ReadonlyAuthConfig,
-    ServerConfig, ServerNoticeMessage, WireMessage, WsConfig, parse_server_config,
+    DiskUsage, HelloMessage, LoadAverage, MemoryUsage, MetricsMessage, NetworkCounters,
+    NodeSnapshot, PingMessage, PongMessage, ReadonlyAuthConfig, ServerConfig, ServerNoticeMessage,
+    WireMessage, WsConfig, parse_server_config, percentage,
 };
 
 use crate::history::HistoryStore;
@@ -151,6 +152,9 @@ const INSTALL_AGENT_SCRIPT: &str = include_str!("../../scripts/install-agent.sh"
 const HELLO_TIMEOUT_SECS: u64 = 10;
 const MAX_OUTSTANDING_PINGS: usize = 32;
 const INSECURE_TRANSPORT_WARN_INTERVAL_SECS: u64 = 900;
+const MAX_SANITIZED_DISKS: usize = 128;
+const MAX_SANITIZED_RATE_BYTES_PER_SEC: f64 = 1_000_000_000_000.0;
+const MAX_SANITIZED_LOAD: f64 = 1_000_000.0;
 const DEFAULT_HISTORY_WINDOW_HOURS: u64 = 24;
 const DEFAULT_HISTORY_MAX_POINTS: usize = 480;
 const MAX_HISTORY_MAX_POINTS: usize = 1440;
@@ -1074,13 +1078,86 @@ async fn restore_snapshot_if_available(shared: &SharedState, path: &Path) {
 }
 
 fn sanitize_snapshot(config: &ServerConfig, mut snapshot: NodeSnapshot) -> NodeSnapshot {
-    snapshot.disks.retain(|disk| {
-        !config
-            .ignored_filesystems
-            .iter()
-            .any(|fs| fs == &disk.fs_type)
-    });
+    snapshot.cpu_usage_percent = sanitize_percentage(snapshot.cpu_usage_percent);
+    snapshot.load = sanitize_load_average(snapshot.load);
+    snapshot.memory = sanitize_memory_usage(snapshot.memory);
+    snapshot.network = sanitize_network_counters(snapshot.network);
+    snapshot.disks = snapshot
+        .disks
+        .into_iter()
+        .filter(|disk| {
+            !config
+                .ignored_filesystems
+                .iter()
+                .any(|fs| fs == &disk.fs_type)
+        })
+        .filter_map(sanitize_disk_usage)
+        .take(MAX_SANITIZED_DISKS)
+        .collect();
     snapshot
+}
+
+fn sanitize_percentage(value: f64) -> f64 {
+    sanitize_non_negative_f64(value, 100.0)
+}
+
+fn sanitize_non_negative_f64(value: f64, max: f64) -> f64 {
+    if value.is_nan() || value < 0.0 {
+        return 0.0;
+    }
+    if value.is_infinite() {
+        return max;
+    }
+
+    value.min(max)
+}
+
+fn sanitize_load_average(load: LoadAverage) -> LoadAverage {
+    LoadAverage {
+        one: sanitize_non_negative_f64(load.one, MAX_SANITIZED_LOAD),
+        five: sanitize_non_negative_f64(load.five, MAX_SANITIZED_LOAD),
+        fifteen: sanitize_non_negative_f64(load.fifteen, MAX_SANITIZED_LOAD),
+    }
+}
+
+fn sanitize_memory_usage(mut memory: MemoryUsage) -> MemoryUsage {
+    memory.used_bytes = memory.used_bytes.min(memory.total_bytes);
+    memory.available_bytes = memory.available_bytes.min(memory.total_bytes);
+    if memory.used_bytes.saturating_add(memory.available_bytes) > memory.total_bytes {
+        memory.available_bytes = memory.total_bytes.saturating_sub(memory.used_bytes);
+    }
+
+    memory.swap_used_bytes = memory.swap_used_bytes.min(memory.swap_total_bytes);
+    memory
+}
+
+fn sanitize_disk_usage(mut disk: DiskUsage) -> Option<DiskUsage> {
+    disk.device = disk.device.trim().to_string();
+    disk.mount_point = disk.mount_point.trim().to_string();
+    disk.fs_type = disk.fs_type.trim().to_string();
+    if disk.device.is_empty() || disk.mount_point.is_empty() || disk.fs_type.is_empty() {
+        return None;
+    }
+
+    disk.available_bytes = disk.available_bytes.min(disk.total_bytes);
+    disk.used_bytes = disk.used_bytes.min(disk.total_bytes);
+    if disk.used_bytes.saturating_add(disk.available_bytes) > disk.total_bytes {
+        disk.used_bytes = disk.total_bytes.saturating_sub(disk.available_bytes);
+    }
+    disk.used_percent = sanitize_percentage(percentage(disk.used_bytes, disk.total_bytes));
+    Some(disk)
+}
+
+fn sanitize_network_counters(mut network: NetworkCounters) -> NetworkCounters {
+    network.rx_bytes_per_sec =
+        sanitize_optional_rate(network.rx_bytes_per_sec, MAX_SANITIZED_RATE_BYTES_PER_SEC);
+    network.tx_bytes_per_sec =
+        sanitize_optional_rate(network.tx_bytes_per_sec, MAX_SANITIZED_RATE_BYTES_PER_SEC);
+    network
+}
+
+fn sanitize_optional_rate(value: Option<f64>, max: f64) -> Option<f64> {
+    value.map(|value| sanitize_non_negative_f64(value, max))
 }
 
 fn prune_outstanding_pings(outstanding_pings: &mut HashMap<u64, Instant>, max_age: Duration) {
@@ -1121,20 +1198,22 @@ mod tests {
     use axum::Router;
     use axum::body::Body;
     use axum::http::{HeaderMap, Request, header};
+    use chrono::Utc;
     use tokio::runtime::Runtime;
 
     use super::{
-        AppState, ReadonlyRouteAuth, WsAdmissionController, WsAdmissionError, bootstrap, healthz,
-        index, install_agent_script, install_bootstrap, node_detail, node_history, node_status,
-        nodes, overview, resolve_client_ip, ui_i18n_asset, uses_insecure_remote_public_base_url,
-        ws_handler,
+        AppState, MAX_SANITIZED_LOAD, MAX_SANITIZED_RATE_BYTES_PER_SEC, ReadonlyRouteAuth,
+        WsAdmissionController, WsAdmissionError, bootstrap, healthz, index,
+        install_agent_script, install_bootstrap, node_detail, node_history, node_status, nodes,
+        overview, resolve_client_ip, sanitize_snapshot, ui_i18n_asset,
+        uses_insecure_remote_public_base_url, ws_handler,
     };
     use crate::history::HistoryStore;
     use crate::registry::NodeRegistry;
     use crate::state::SharedState;
     use axum::routing::get;
     use tower_http::trace::TraceLayer;
-    use ximonitor_proto::{ServerConfig, WsConfig};
+    use ximonitor_proto::{NodeSnapshot, ServerConfig, WsConfig};
 
     #[test]
     fn router_builds_with_v08_path_syntax() {
@@ -1241,6 +1320,105 @@ mod tests {
             "http://localhost:8080",
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080)),
         ));
+    }
+
+    #[test]
+    fn sanitize_snapshot_clamps_invalid_metrics() {
+        let config = ServerConfig {
+            listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080)),
+            public_base_url: "http://127.0.0.1:8080".to_string(),
+            readonly_auth: None,
+            ws: WsConfig {
+                max_total_connections: 32,
+                max_connections_per_ip: 8,
+                auth_fail_window_secs: 300,
+                auth_fail_max_attempts: 6,
+                auth_block_secs: 600,
+            },
+            node_registry_path: PathBuf::from("./data/server.json"),
+            history_db_path: PathBuf::from("./data/history.sqlite3"),
+            snapshot_path: PathBuf::from("./data/snapshot.json"),
+            stale_after_secs: 15,
+            ping_interval_secs: 5,
+            max_message_bytes: 64 * 1024,
+            refresh_interval_secs: 5,
+            ignored_filesystems: vec!["tmpfs".to_string()],
+            agent_release_base_url: None,
+            agent_release_sha256_x86_64: None,
+            agent_release_sha256_aarch64: None,
+        };
+        let snapshot = NodeSnapshot {
+            collected_at: Utc::now(),
+            cpu_usage_percent: f64::INFINITY,
+            load: ximonitor_proto::LoadAverage {
+                one: -1.0,
+                five: f64::NAN,
+                fifteen: 2_000_000.0,
+            },
+            memory: ximonitor_proto::MemoryUsage {
+                total_bytes: 100,
+                used_bytes: 200,
+                available_bytes: 100,
+                swap_total_bytes: 50,
+                swap_used_bytes: 99,
+            },
+            uptime_secs: 5,
+            disks: vec![
+                ximonitor_proto::DiskUsage {
+                    device: " /dev/vda1 ".to_string(),
+                    mount_point: " / ".to_string(),
+                    fs_type: " ext4 ".to_string(),
+                    total_bytes: 100,
+                    available_bytes: 80,
+                    used_bytes: 90,
+                    used_percent: 999.0,
+                },
+                ximonitor_proto::DiskUsage {
+                    device: "tmp".to_string(),
+                    mount_point: "/run".to_string(),
+                    fs_type: "tmpfs".to_string(),
+                    total_bytes: 1,
+                    available_bytes: 0,
+                    used_bytes: 1,
+                    used_percent: 100.0,
+                },
+                ximonitor_proto::DiskUsage {
+                    device: " ".to_string(),
+                    mount_point: "/bad".to_string(),
+                    fs_type: "xfs".to_string(),
+                    total_bytes: 100,
+                    available_bytes: 10,
+                    used_bytes: 90,
+                    used_percent: 90.0,
+                },
+            ],
+            network: ximonitor_proto::NetworkCounters {
+                total_rx_bytes: 1,
+                total_tx_bytes: 2,
+                rx_bytes_per_sec: Some(-10.0),
+                tx_bytes_per_sec: Some(f64::INFINITY),
+            },
+        };
+
+        let sanitized = sanitize_snapshot(&config, snapshot);
+        assert_eq!(sanitized.cpu_usage_percent, 100.0);
+        assert_eq!(sanitized.load.one, 0.0);
+        assert_eq!(sanitized.load.five, 0.0);
+        assert_eq!(sanitized.load.fifteen, MAX_SANITIZED_LOAD);
+        assert_eq!(sanitized.memory.used_bytes, 100);
+        assert_eq!(sanitized.memory.available_bytes, 0);
+        assert_eq!(sanitized.memory.swap_used_bytes, 50);
+        assert_eq!(sanitized.network.rx_bytes_per_sec, Some(0.0));
+        assert_eq!(
+            sanitized.network.tx_bytes_per_sec,
+            Some(MAX_SANITIZED_RATE_BYTES_PER_SEC)
+        );
+        assert_eq!(sanitized.disks.len(), 1);
+        assert_eq!(sanitized.disks[0].device, "/dev/vda1");
+        assert_eq!(sanitized.disks[0].mount_point, "/");
+        assert_eq!(sanitized.disks[0].fs_type, "ext4");
+        assert_eq!(sanitized.disks[0].used_bytes, 20);
+        assert_eq!(sanitized.disks[0].used_percent, 20.0);
     }
 
     #[test]

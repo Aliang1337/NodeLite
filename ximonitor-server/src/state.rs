@@ -223,23 +223,25 @@ impl Registry {
         let total_rx_bytes = statuses
             .iter()
             .filter_map(|status| status.snapshot.as_ref())
-            .map(|snapshot| snapshot.network.total_rx_bytes)
-            .sum();
+            .fold(0_u64, |total, snapshot| {
+                total.saturating_add(snapshot.network.total_rx_bytes)
+            });
         let total_tx_bytes = statuses
             .iter()
             .filter_map(|status| status.snapshot.as_ref())
-            .map(|snapshot| snapshot.network.total_tx_bytes)
-            .sum();
+            .fold(0_u64, |total, snapshot| {
+                total.saturating_add(snapshot.network.total_tx_bytes)
+            });
         let current_rx_bytes_per_sec = statuses
             .iter()
             .filter_map(|status| status.snapshot.as_ref())
             .filter_map(|snapshot| snapshot.network.rx_bytes_per_sec)
-            .sum();
+            .fold(0.0, sum_finite_f64);
         let current_tx_bytes_per_sec = statuses
             .iter()
             .filter_map(|status| status.snapshot.as_ref())
             .filter_map(|snapshot| snapshot.network.tx_bytes_per_sec)
-            .sum();
+            .fold(0.0, sum_finite_f64);
 
         let latencies: Vec<u64> = statuses
             .iter()
@@ -276,6 +278,15 @@ impl Registry {
             );
         }
     }
+}
+
+fn sum_finite_f64(total: f64, value: f64) -> f64 {
+    if !value.is_finite() || value < 0.0 {
+        return total;
+    }
+
+    let next = total + value;
+    if next.is_finite() { next } else { f64::MAX }
 }
 
 #[cfg(test)]
@@ -343,6 +354,43 @@ mod tests {
                 .expect("node status")
                 .online
         );
+    }
+
+    #[test]
+    fn overview_saturates_totals_and_skips_invalid_rates() {
+        let mut registry = Registry::default();
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 0, 0, 0).unwrap();
+
+        registry.register_node(1, sample_identity(), now);
+        registry.register_node(
+            2,
+            NodeIdentity {
+                node_id: "sg-01".to_string(),
+                node_label: "Singapore 01".to_string(),
+                ..sample_identity()
+            },
+            now,
+        );
+
+        let mut first = sample_snapshot(now);
+        first.network.total_rx_bytes = u64::MAX;
+        first.network.total_tx_bytes = u64::MAX;
+        first.network.rx_bytes_per_sec = Some(f64::INFINITY);
+        first.network.tx_bytes_per_sec = Some(1.5);
+        registry.update_snapshot("hk-01", 1, first, now);
+
+        let mut second = sample_snapshot(now);
+        second.network.total_rx_bytes = 42;
+        second.network.total_tx_bytes = 99;
+        second.network.rx_bytes_per_sec = Some(2.5);
+        second.network.tx_bytes_per_sec = Some(-10.0);
+        registry.update_snapshot("sg-01", 2, second, now);
+
+        let overview = registry.overview();
+        assert_eq!(overview.total_rx_bytes, u64::MAX);
+        assert_eq!(overview.total_tx_bytes, u64::MAX);
+        assert_eq!(overview.current_rx_bytes_per_sec, 2.5);
+        assert_eq!(overview.current_tx_bytes_per_sec, 1.5);
     }
 
     fn sample_identity() -> NodeIdentity {
