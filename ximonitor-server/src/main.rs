@@ -194,6 +194,8 @@ const MAX_OUTSTANDING_PINGS: usize = 32;
 const INSECURE_TRANSPORT_WARN_INTERVAL_SECS: u64 = 900;
 /// 历史采样中允许的最大磁盘条目数,防止恶意 Agent 制造海量条目。
 const MAX_SANITIZED_DISKS: usize = 128;
+/// 单个磁盘字段(device/mount_point/fs_type)允许的最大字节数,防止 Agent 上报巨型字符串撑爆 UI 与历史库。
+const MAX_SANITIZED_STRING_BYTES: usize = 256;
 /// 网络速率字段的合法上限(字节/秒)。
 const MAX_SANITIZED_RATE_BYTES_PER_SEC: f64 = 1_000_000_000_000.0;
 /// 负载平均数的合法上限。
@@ -1236,6 +1238,10 @@ fn sanitize_disk_usage(mut disk: DiskUsage) -> Option<DiskUsage> {
     if disk.device.is_empty() || disk.mount_point.is_empty() || disk.fs_type.is_empty() {
         return None;
     }
+    // 字符串字段做硬截断,避免 Agent 上报巨型字符串污染 UI 或历史库。
+    truncate_to_byte_boundary(&mut disk.device, MAX_SANITIZED_STRING_BYTES);
+    truncate_to_byte_boundary(&mut disk.mount_point, MAX_SANITIZED_STRING_BYTES);
+    truncate_to_byte_boundary(&mut disk.fs_type, MAX_SANITIZED_STRING_BYTES);
 
     disk.available_bytes = disk.available_bytes.min(disk.total_bytes);
     disk.used_bytes = disk.used_bytes.min(disk.total_bytes);
@@ -1257,6 +1263,18 @@ fn sanitize_network_counters(mut network: NetworkCounters) -> NetworkCounters {
 
 fn sanitize_optional_rate(value: Option<f64>, max: f64) -> Option<f64> {
     value.map(|value| sanitize_non_negative_f64(value, max))
+}
+
+/// 把字符串截到不超过 `max_bytes` 字节,且必须落在 UTF-8 字符边界上。
+fn truncate_to_byte_boundary(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut cutoff = max_bytes;
+    while !value.is_char_boundary(cutoff) {
+        cutoff -= 1;
+    }
+    value.truncate(cutoff);
 }
 
 /// 清理"过期或过多"的 Ping 记录,避免在 Agent 异常时无限制堆积。
@@ -1303,11 +1321,11 @@ mod tests {
     use tokio::runtime::Runtime;
 
     use super::{
-        AppState, MAX_SANITIZED_LOAD, MAX_SANITIZED_RATE_BYTES_PER_SEC, ReadonlyRouteAuth,
-        WsAdmissionController, WsAdmissionError, bootstrap, healthz, index, install_agent_script,
-        install_bootstrap, node_detail, node_history, node_status, nodes, overview,
-        resolve_client_ip, sanitize_snapshot, ui_i18n_asset, uses_insecure_remote_public_base_url,
-        ws_handler,
+        AppState, MAX_SANITIZED_LOAD, MAX_SANITIZED_RATE_BYTES_PER_SEC,
+        MAX_SANITIZED_STRING_BYTES, ReadonlyRouteAuth, WsAdmissionController, WsAdmissionError,
+        bootstrap, healthz, index, install_agent_script, install_bootstrap, node_detail,
+        node_history, node_status, nodes, overview, resolve_client_ip, sanitize_snapshot,
+        truncate_to_byte_boundary, ui_i18n_asset, uses_insecure_remote_public_base_url, ws_handler,
     };
     use crate::history::HistoryStore;
     use crate::registry::NodeRegistry;
@@ -1522,6 +1540,88 @@ mod tests {
         assert_eq!(sanitized.disks[0].fs_type, "ext4");
         assert_eq!(sanitized.disks[0].used_bytes, 20);
         assert_eq!(sanitized.disks[0].used_percent, 20.0);
+    }
+
+    #[test]
+    fn sanitize_caps_disk_field_string_length() {
+        let config = ServerConfig {
+            listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080)),
+            public_base_url: "http://127.0.0.1:8080".to_string(),
+            insecure_allow_http: false,
+            readonly_auth: None,
+            ws: WsConfig {
+                max_total_connections: 32,
+                max_connections_per_ip: 8,
+                auth_fail_window_secs: 300,
+                auth_fail_max_attempts: 6,
+                auth_block_secs: 600,
+            },
+            node_registry_path: PathBuf::from("./data/server.json"),
+            history_db_path: PathBuf::from("./data/history.sqlite3"),
+            snapshot_path: PathBuf::from("./data/snapshot.json"),
+            stale_after_secs: 15,
+            ping_interval_secs: 5,
+            max_message_bytes: 64 * 1024,
+            refresh_interval_secs: 5,
+            ignored_filesystems: Vec::new(),
+            agent_release_base_url: None,
+            agent_release_sha256_x86_64: None,
+            agent_release_sha256_aarch64: None,
+        };
+        let oversized = "x".repeat(MAX_SANITIZED_STRING_BYTES * 4);
+        let snapshot = NodeSnapshot {
+            collected_at: Utc::now(),
+            cpu_usage_percent: 10.0,
+            load: ximonitor_proto::LoadAverage {
+                one: 0.0,
+                five: 0.0,
+                fifteen: 0.0,
+            },
+            memory: ximonitor_proto::MemoryUsage {
+                total_bytes: 100,
+                used_bytes: 50,
+                available_bytes: 50,
+                swap_total_bytes: 0,
+                swap_used_bytes: 0,
+            },
+            uptime_secs: 1,
+            disks: vec![ximonitor_proto::DiskUsage {
+                device: format!("/dev/{oversized}"),
+                mount_point: format!("/mnt/{oversized}"),
+                fs_type: oversized.clone(),
+                total_bytes: 100,
+                available_bytes: 50,
+                used_bytes: 50,
+                used_percent: 50.0,
+            }],
+            network: ximonitor_proto::NetworkCounters {
+                total_rx_bytes: 0,
+                total_tx_bytes: 0,
+                rx_bytes_per_sec: None,
+                tx_bytes_per_sec: None,
+            },
+        };
+
+        let sanitized = sanitize_snapshot(&config, snapshot);
+        assert_eq!(sanitized.disks.len(), 1);
+        assert!(sanitized.disks[0].device.len() <= MAX_SANITIZED_STRING_BYTES);
+        assert!(sanitized.disks[0].mount_point.len() <= MAX_SANITIZED_STRING_BYTES);
+        assert!(sanitized.disks[0].fs_type.len() <= MAX_SANITIZED_STRING_BYTES);
+    }
+
+    #[test]
+    fn truncate_to_byte_boundary_respects_char_boundary() {
+        // "中" 在 UTF-8 中占 3 字节;cutoff = 7 必须回退到 6 字节边界。
+        let mut value = "中".repeat(100);
+        truncate_to_byte_boundary(&mut value, 7);
+        assert!(value.len() <= 7);
+        assert!(value.is_char_boundary(value.len()));
+        assert!(value.chars().all(|ch| ch == '中'));
+
+        // 已经在限内的字符串保持不变。
+        let mut short = "abc".to_string();
+        truncate_to_byte_boundary(&mut short, 16);
+        assert_eq!(short, "abc");
     }
 
     #[test]
