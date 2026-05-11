@@ -1,3 +1,16 @@
+// XiMonitor 中心服务入口。
+//
+// 角色:
+// - 通过 `/ws` 接收 Agent 上报的 WebSocket 连接;
+// - 通过 `/api/*` 与静态 HTML 给前端提供只读视图;
+// - 通过 `install-agent` / `upgrade-agent` 子命令为运维生成安装脚本片段。
+//
+// 关键设计:
+// - `AppState` 由 `SharedState`(运行态)、`NodeRegistry`(凭证)与 `HistoryStore`(SQLite)组成,
+//   每个 HTTP / WebSocket 处理函数都得到一份廉价克隆。
+// - WebSocket 接入由 `WsAdmissionController` 做总量限流 + IP 限流 + 暴力破解封禁。
+// - 来自 Agent 的所有指标都经过 `sanitize_snapshot` 处理,防止异常值污染统计或图表。
+
 mod history;
 mod registry;
 mod snapshot;
@@ -47,23 +60,30 @@ use crate::snapshot::{load_snapshot, spawn_snapshot_persistor};
 use crate::state::SharedState;
 use crate::ui::{UI_I18N_JSON, index_html, node_html};
 
+/// 顶层命令行参数。
 #[derive(Debug, Parser)]
 #[command(name = "ximonitor-server")]
 #[command(about = "XiMonitor central server")]
 struct Cli {
+    /// 配置文件路径,默认 `config/server.toml`。
     #[arg(long, global = true, default_value = "config/server.toml")]
     config: PathBuf,
+    /// 可选子命令。不指定时进入"启动 Web 服务"模式。
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// 颁发节点凭证(仅打印,不安装到 Agent 节点上)。
     IssueNode(NodeCommandArgs),
+    /// 颁发节点凭证并打印 Agent 上的安装命令。
     InstallAgent(NodeCommandArgs),
+    /// 打印就地升级 Agent 所需的命令。
     UpgradeAgent,
 }
 
+/// 节点相关命令的共享参数。
 #[derive(Debug, Parser, Clone)]
 struct NodeCommandArgs {
     #[arg(long)]
@@ -72,10 +92,12 @@ struct NodeCommandArgs {
     node_label: Option<String>,
     #[arg(long = "tag")]
     tags: Vec<String>,
+    /// 是否强制轮换该节点的现有 token。
     #[arg(long)]
     rotate_token: bool,
 }
 
+/// 在各处理器之间共享的运行时上下文。
 #[derive(Clone)]
 struct AppState {
     history: HistoryStore,
@@ -84,11 +106,13 @@ struct AppState {
     ws_admission: WsAdmissionController,
 }
 
+/// 包装 HTTP 基本认证,用于保护 `/api/*` 与 HTML 视图。
 #[derive(Debug, Clone)]
 struct ReadonlyRouteAuth {
     expected_authorization: Option<String>,
 }
 
+/// `/api/bootstrap` 的响应结构,只读、用于前端启动期获取基本元数据。
 #[derive(Debug, Serialize)]
 struct BootstrapResponse {
     service: &'static str,
@@ -98,6 +122,7 @@ struct BootstrapResponse {
     registered_nodes: usize,
 }
 
+/// CLI 中 `issue-node` / `install-agent` 共享的产出结构。
 struct IssuedNodeBundle {
     issued: crate::registry::IssueNodeResult,
     install_command: String,
@@ -105,12 +130,19 @@ struct IssuedNodeBundle {
     agent_release_base_url: String,
 }
 
+/// WebSocket 处理流程中的错误来源区分:
+/// `Client` 表示因对方原因(协议错误、未认证)而断开,只记 warn;
+/// `Server` 表示我们这边出现异常,记 error。
 #[derive(Debug)]
 enum ProtocolError {
     Client(String),
     Server(anyhow::Error),
 }
 
+/// 单帧解析结果:
+/// `Wire` 是携带 JSON 业务消息的文本帧;
+/// `Control` 是底层心跳(Ping/Pong)等,无需上层处理;
+/// `Close` 表示对方发起了关闭。
 #[derive(Debug)]
 enum ParsedFrame {
     Wire(Box<WireMessage>),
@@ -118,6 +150,7 @@ enum ParsedFrame {
     Close,
 }
 
+/// WebSocket 准入控制器:封装总量限流、IP 限流与认证失败封禁。
 #[derive(Clone)]
 struct WsAdmissionController {
     config: WsConfig,
@@ -131,34 +164,50 @@ struct WsAdmissionState {
     auth_failures: HashMap<IpAddr, AuthFailureState>,
 }
 
+/// 单个 IP 的认证失败历史。
 #[derive(Debug, Default)]
 struct AuthFailureState {
     recent_failures: VecDeque<Instant>,
     blocked_until: Option<Instant>,
 }
 
+/// RAII 句柄:存在意味着占用一个 WebSocket 连接槽,析构时归还。
 struct WsConnectionPermit {
     controller: WsAdmissionController,
     client_ip: IpAddr,
 }
 
+/// 准入失败的具体原因,对应到不同的 HTTP 响应。
 enum WsAdmissionError {
     TotalCapacity,
     IpCapacity,
     Blocked { retry_after_secs: u64 },
 }
 
+/// 把 `scripts/install-agent.sh` 在编译期嵌入到二进制内。
 const INSTALL_AGENT_SCRIPT: &str = include_str!("../../scripts/install-agent.sh");
+/// 等待 Hello 报文的超时时间(秒)。
 const HELLO_TIMEOUT_SECS: u64 = 10;
+/// 同时未应答的 Ping 上限,超过后会丢弃最老的一条,避免内存占用无限增长。
 const MAX_OUTSTANDING_PINGS: usize = 32;
+/// 不安全传输警告的输出间隔(秒)。
 const INSECURE_TRANSPORT_WARN_INTERVAL_SECS: u64 = 900;
+/// 历史采样中允许的最大磁盘条目数,防止恶意 Agent 制造海量条目。
 const MAX_SANITIZED_DISKS: usize = 128;
+/// 网络速率字段的合法上限(字节/秒)。
 const MAX_SANITIZED_RATE_BYTES_PER_SEC: f64 = 1_000_000_000_000.0;
+/// 负载平均数的合法上限。
 const MAX_SANITIZED_LOAD: f64 = 1_000_000.0;
+/// 历史接口默认查询窗口(小时)。
 const DEFAULT_HISTORY_WINDOW_HOURS: u64 = 24;
+/// 历史接口默认返回的样本点数。
 const DEFAULT_HISTORY_MAX_POINTS: usize = 480;
+/// 历史接口允许的最大样本点数。
 const MAX_HISTORY_MAX_POINTS: usize = 1440;
 
+/// 历史查询接口的查询字符串参数。
+///
+/// `start` / `end` 必须同时提供;否则使用 `window_hours` 表示"过去 N 小时"。
 #[derive(Debug, Deserialize, Default)]
 struct HistoryQuery {
     window_hours: Option<u64>,
@@ -174,6 +223,7 @@ impl From<anyhow::Error> for ProtocolError {
 }
 
 impl ReadonlyRouteAuth {
+    /// 根据可选的基本认证配置预先计算"期望的 Authorization 头",免去每次请求都重新编码。
     fn from_config(config: Option<ReadonlyAuthConfig>) -> Self {
         let expected_authorization = config.map(|config| {
             let credentials = format!("{}:{}", config.username, config.password);
@@ -185,6 +235,7 @@ impl ReadonlyRouteAuth {
         }
     }
 
+    /// 判断单次请求是否带有合法的 Basic 凭证;未启用认证时直接放行。
     fn is_authorized(&self, request: &Request) -> bool {
         let Some(expected_authorization) = self.expected_authorization.as_deref() else {
             return true;
@@ -206,6 +257,9 @@ impl WsAdmissionController {
         }
     }
 
+    /// 尝试占用一个 WebSocket 连接配额。
+    ///
+    /// 返回 RAII 句柄;它一旦析构,连接计数会被自动回退,无需手动 release。
     fn try_acquire(&self, client_ip: IpAddr) -> Result<WsConnectionPermit, WsAdmissionError> {
         let now = Instant::now();
         let mut state = self.lock_state();
@@ -240,6 +294,7 @@ impl WsAdmissionController {
         })
     }
 
+    /// 记录一次认证失败,达到阈值后把客户端 IP 临时封禁。
     fn record_auth_failure(&self, client_ip: IpAddr) {
         let now = Instant::now();
         let failure_window = Duration::from_secs(self.config.auth_fail_window_secs);
@@ -254,11 +309,13 @@ impl WsAdmissionController {
         }
     }
 
+    /// 认证成功后清理该 IP 的失败历史。
     fn clear_auth_failures(&self, client_ip: IpAddr) {
         let mut state = self.lock_state();
         state.auth_failures.remove(&client_ip);
     }
 
+    /// 由 `WsConnectionPermit::drop` 调用,把计数减回去。
     fn release_connection(&self, client_ip: IpAddr) {
         let mut state = self.lock_state();
         state.total_active_connections = state.total_active_connections.saturating_sub(1);
@@ -270,6 +327,7 @@ impl WsAdmissionController {
         }
     }
 
+    /// 锁住状态;锁中毒时取出受污染状态继续,因为不愿意因此让整个服务崩溃。
     fn lock_state(&self) -> std::sync::MutexGuard<'_, WsAdmissionState> {
         self.state
             .lock()
@@ -283,6 +341,7 @@ impl Drop for WsConnectionPermit {
     }
 }
 
+/// 启动入口:根据 CLI 子命令分发到具体动作。
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -298,6 +357,7 @@ async fn main() -> Result<()> {
     }
 }
 
+/// 启动 Web 服务:加载配置 → 初始化各子系统 → 注册路由 → 监听端口。
 async fn run_server(config_path: &Path) -> Result<()> {
     let config = Arc::new(load_server_config(config_path).await?);
     let listen_addr = config.listen;
@@ -376,6 +436,7 @@ async fn run_server(config_path: &Path) -> Result<()> {
     .context("server exited unexpectedly")
 }
 
+/// `server issue-node`:创建/更新节点并打印对应的 agent.toml 与安装命令。
 async fn issue_node_command(config_path: &Path, args: NodeCommandArgs) -> Result<()> {
     let config = load_server_config(config_path).await?;
     let bundle = issue_node_bundle(&config, &args).await?;
@@ -409,6 +470,7 @@ async fn issue_node_command(config_path: &Path, args: NodeCommandArgs) -> Result
     Ok(())
 }
 
+/// `server install-agent`:只打印安装命令,适合管道式使用。
 async fn install_agent_command(config_path: &Path, args: NodeCommandArgs) -> Result<()> {
     let config = load_server_config(config_path).await?;
     let bundle = issue_node_bundle(&config, &args).await?;
@@ -416,6 +478,7 @@ async fn install_agent_command(config_path: &Path, args: NodeCommandArgs) -> Res
     Ok(())
 }
 
+/// `server upgrade-agent`:打印就地升级现有 Agent 的命令。
 async fn upgrade_agent_command(config_path: &Path) -> Result<()> {
     let config = load_server_config(config_path).await?;
     let agent_release_base_url = default_agent_release_base_url()?;
@@ -424,6 +487,7 @@ async fn upgrade_agent_command(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 同时完成"节点登记"和"安装命令渲染",供两个 CLI 子命令复用。
 async fn issue_node_bundle(
     config: &ServerConfig,
     args: &NodeCommandArgs,
@@ -455,6 +519,7 @@ async fn issue_node_bundle(
     })
 }
 
+/// 加载并解析 server.toml,顺带对 snapshot / history 目录的不存在情况发出提醒。
 async fn load_server_config(path: &Path) -> Result<ServerConfig> {
     let content = fs::read_to_string(path)
         .await
@@ -484,10 +549,12 @@ async fn load_server_config(path: &Path) -> Result<ServerConfig> {
     Ok(config)
 }
 
+/// 首页 HTML:把刷新周期等参数注入模板。
 async fn index(State(state): State<AppState>) -> Html<String> {
     Html(index_html(state.shared.config().refresh_interval_secs))
 }
 
+/// 节点详情页 HTML。
 async fn node_detail(
     State(state): State<AppState>,
     AxumPath(node_id): AxumPath<String>,
@@ -498,6 +565,7 @@ async fn node_detail(
     ))
 }
 
+/// 把前端 i18n 字典作为静态 JSON 文件提供。
 async fn ui_i18n_asset() -> Response {
     (
         [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
@@ -506,10 +574,12 @@ async fn ui_i18n_asset() -> Response {
         .into_response()
 }
 
+/// 健康检查接口,始终返回 200。
 async fn healthz() -> StatusCode {
     StatusCode::OK
 }
 
+/// 中间件:对受保护路由强制基本认证;放行时把 Request 继续交给下一个处理器。
 async fn require_readonly_auth(
     State(auth): State<ReadonlyRouteAuth>,
     request: Request,
@@ -527,6 +597,7 @@ async fn require_readonly_auth(
         .into_response()
 }
 
+/// 提供给前端读取的"引导信息":服务名、刷新周期与已登记节点数。
 async fn bootstrap(State(state): State<AppState>) -> impl IntoResponse {
     Json(BootstrapResponse {
         service: "ximonitor-server",
@@ -537,6 +608,7 @@ async fn bootstrap(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
+/// 暴露内置安装脚本,供 `curl | sh` 模式安装 Agent 时下载。
 async fn install_agent_script() -> Response {
     (
         [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
@@ -545,6 +617,7 @@ async fn install_agent_script() -> Response {
         .into_response()
 }
 
+/// Agent 安装脚本通过 Bearer 安装令牌请求该端点来换取自己的 agent.toml。
 async fn install_bootstrap(State(state): State<AppState>, request: Request) -> Response {
     let Some(token) = bearer_token_from_request(&request) else {
         return (
@@ -598,14 +671,17 @@ async fn install_bootstrap(State(state): State<AppState>, request: Request) -> R
     }
 }
 
+/// 仪表盘顶部的总览数据。
 async fn overview(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.shared.overview().await)
 }
 
+/// 所有节点的最新状态。
 async fn nodes(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.shared.list_statuses().await)
 }
 
+/// 单个节点的最新状态;不存在时返回 404。
 async fn node_status(
     State(state): State<AppState>,
     AxumPath(node_id): AxumPath<String>,
@@ -616,6 +692,7 @@ async fn node_status(
     }
 }
 
+/// 节点历史趋势接口。支持"过去 N 小时"或"指定区间"两种调用方式。
 async fn node_history(
     State(state): State<AppState>,
     AxumPath(node_id): AxumPath<String>,
@@ -669,6 +746,7 @@ async fn node_history(
     }
 }
 
+/// `/ws` 入口:在 WebSocket 升级前先做准入检查与帧大小限制。
 async fn ws_handler(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -697,6 +775,7 @@ async fn ws_handler(
         })
 }
 
+/// 一次完整的 WebSocket 会话:握手 → 认证 → 数据循环 → 资源回收。
 async fn handle_socket(
     state: AppState,
     client_ip: IpAddr,
@@ -837,6 +916,7 @@ async fn handle_socket(
     session_result
 }
 
+/// 阻塞接收 Hello 帧;期间收到的 Ping/Pong 等控制帧会被忽略,其他业务帧视为协议错误。
 async fn recv_hello(socket: &mut WebSocket) -> Result<HelloMessage, ProtocolError> {
     loop {
         let Some(message) = socket
@@ -869,6 +949,7 @@ async fn recv_hello(socket: &mut WebSocket) -> Result<HelloMessage, ProtocolErro
     }
 }
 
+/// 解析底层 WebSocket 帧,把它归类为业务消息 / 控制帧 / 关闭。
 fn parse_wire_message(message: Message) -> Result<ParsedFrame, ProtocolError> {
     match message {
         Message::Text(text) => serde_json::from_str::<WireMessage>(&text)
@@ -883,6 +964,7 @@ fn parse_wire_message(message: Message) -> Result<ParsedFrame, ProtocolError> {
     }
 }
 
+/// 把 `WireMessage` 序列化为 JSON 文本帧后发送。
 async fn send_wire_message(
     socket: &mut WebSocket,
     message: &WireMessage,
@@ -896,6 +978,7 @@ async fn send_wire_message(
     Ok(())
 }
 
+/// 后台任务:每秒扫描一次注册表,把超时节点标记为离线。
 fn spawn_stale_reaper(shared: SharedState) {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(1));
@@ -909,6 +992,7 @@ fn spawn_stale_reaper(shared: SharedState) {
     });
 }
 
+/// 后台任务:每秒检查一次注册表文件是否有外部更改(例如 CLI 颁发了新节点)。
 fn spawn_registry_reloader(registry: NodeRegistry) {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(1));
@@ -936,6 +1020,7 @@ fn spawn_registry_reloader(registry: NodeRegistry) {
     });
 }
 
+/// 从请求头中解析 `Authorization: Bearer <token>`,缺失或为空时返回 `None`。
 fn bearer_token_from_request(request: &Request) -> Option<&str> {
     request
         .headers()
@@ -946,6 +1031,10 @@ fn bearer_token_from_request(request: &Request) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+/// 解析客户端真实 IP。
+///
+/// 当 Server 仅监听回环地址(典型的反向代理部署),允许从 `X-Forwarded-For` / `X-Real-IP` 中读取上游 IP;
+/// 否则直接使用 TCP 连接的对端地址,避免被恶意请求伪造来源。
 fn resolve_client_ip(listen: SocketAddr, peer_addr: SocketAddr, headers: &HeaderMap) -> IpAddr {
     if !listen.ip().is_loopback() {
         return peer_addr.ip();
@@ -976,6 +1065,7 @@ fn parse_ip_addr(value: &str) -> Option<IpAddr> {
     value.parse::<IpAddr>().ok()
 }
 
+/// 清理失败计数与封禁状态:把已过期的项目逐出,使长时间不活跃的 IP 不会被无端封禁。
 fn prune_auth_failure_state(state: &mut AuthFailureState, now: Instant, failure_window: Duration) {
     while state
         .recent_failures
@@ -993,6 +1083,7 @@ fn prune_auth_failure_state(state: &mut AuthFailureState, now: Instant, failure_
     }
 }
 
+/// 把准入控制错误映射成对应的 HTTP 响应。
 fn ws_admission_error_response(error: WsAdmissionError) -> Response {
     match error {
         WsAdmissionError::TotalCapacity => (
@@ -1014,6 +1105,7 @@ fn ws_admission_error_response(error: WsAdmissionError) -> Response {
     }
 }
 
+/// 在监听非回环地址但仍然使用 `http://` 公网基址时,周期性输出 TLS 警告。
 fn spawn_insecure_transport_warning(public_base_url: String, listen: std::net::SocketAddr) {
     if !uses_insecure_remote_public_base_url(&public_base_url, listen) {
         return;
@@ -1062,6 +1154,7 @@ fn host_is_local(host: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+/// 启动期尝试从磁盘恢复一份 NodeStatus 列表,失败时记录日志并继续以空状态启动。
 async fn restore_snapshot_if_available(shared: &SharedState, path: &Path) {
     if !path.exists() {
         return;
@@ -1077,9 +1170,11 @@ async fn restore_snapshot_if_available(shared: &SharedState, path: &Path) {
     }
 }
 
+/// 对来自 Agent 的快照进行二次校验。
+/// 把所有疑似越界的字段统一约束到合法范围,避免它们污染 UI 汇总、聚合或历史表。
 fn sanitize_snapshot(config: &ServerConfig, mut snapshot: NodeSnapshot) -> NodeSnapshot {
-    // Treat agent input as untrusted: clamp impossible values before they can
-    // distort UI summaries, overflow aggregations, or pollute history samples.
+    // Agent 是不受信任的数据源:在进入聚合 / 历史表前,把不可能值卡到上限,
+    // 否则它们会扭曲仪表盘汇总、压垮加和、或污染历史样本。
     snapshot.cpu_usage_percent = sanitize_percentage(snapshot.cpu_usage_percent);
     snapshot.load = sanitize_load_average(snapshot.load);
     snapshot.memory = sanitize_memory_usage(snapshot.memory);
@@ -1126,7 +1221,7 @@ fn sanitize_memory_usage(mut memory: MemoryUsage) -> MemoryUsage {
     memory.used_bytes = memory.used_bytes.min(memory.total_bytes);
     memory.available_bytes = memory.available_bytes.min(memory.total_bytes);
     if memory.used_bytes.saturating_add(memory.available_bytes) > memory.total_bytes {
-        // Keep the pair self-consistent instead of trusting broken agent math.
+        // 当 used + available 大于 total 时,以 used 为准重新算 available,保持口径一致。
         memory.available_bytes = memory.total_bytes.saturating_sub(memory.used_bytes);
     }
 
@@ -1145,7 +1240,7 @@ fn sanitize_disk_usage(mut disk: DiskUsage) -> Option<DiskUsage> {
     disk.available_bytes = disk.available_bytes.min(disk.total_bytes);
     disk.used_bytes = disk.used_bytes.min(disk.total_bytes);
     if disk.used_bytes.saturating_add(disk.available_bytes) > disk.total_bytes {
-        // Recompute a coherent "used" side when the raw counters disagree.
+        // 当两个字段相互矛盾时,以 available 为基线重算 used,得到自洽的 used 部分。
         disk.used_bytes = disk.total_bytes.saturating_sub(disk.available_bytes);
     }
     disk.used_percent = sanitize_percentage(percentage(disk.used_bytes, disk.total_bytes));
@@ -1164,6 +1259,7 @@ fn sanitize_optional_rate(value: Option<f64>, max: f64) -> Option<f64> {
     value.map(|value| sanitize_non_negative_f64(value, max))
 }
 
+/// 清理"过期或过多"的 Ping 记录,避免在 Agent 异常时无限制堆积。
 fn prune_outstanding_pings(outstanding_pings: &mut HashMap<u64, Instant>, max_age: Duration) {
     outstanding_pings.retain(|_, sent_at| sent_at.elapsed() < max_age);
 
@@ -1180,6 +1276,7 @@ fn prune_outstanding_pings(outstanding_pings: &mut HashMap<u64, Instant>, max_ag
     }
 }
 
+/// 初始化 `tracing` 日志,支持通过 `RUST_LOG` 调整级别。
 fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1230,6 +1327,7 @@ mod tests {
         let config = Arc::new(ServerConfig {
             listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080)),
             public_base_url: "http://127.0.0.1:8080".to_string(),
+            insecure_allow_http: false,
             readonly_auth: None,
             ws: WsConfig {
                 max_total_connections: 32,
@@ -1331,6 +1429,7 @@ mod tests {
         let config = ServerConfig {
             listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080)),
             public_base_url: "http://127.0.0.1:8080".to_string(),
+            insecure_allow_http: false,
             readonly_auth: None,
             ws: WsConfig {
                 max_total_connections: 32,

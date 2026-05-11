@@ -313,10 +313,15 @@ load_existing_server_defaults() {
 }
 
 render_server_config() {
+  insecure_allow_http_value="false"
+  if [ "$PUBLIC_SCHEME" = "http" ]; then
+    insecure_allow_http_value="true"
+  fi
   cat <<EOF
 [server]
 listen = "${LISTEN_HOST}:${LISTEN_PORT}"
 public_base_url = "${PUBLIC_SCHEME}://${PUBLIC_HOST}"
+insecure_allow_http = ${insecure_allow_http_value}
 node_registry_path = "${CONFIG_DIR}/server.json"
 history_db_path = "${DATA_DIR}/history.sqlite3"
 snapshot_path = "${DATA_DIR}/snapshot.json"

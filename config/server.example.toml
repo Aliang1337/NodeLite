@@ -1,6 +1,9 @@
 [server]
 listen = "127.0.0.1:8080"
 public_base_url = "https://monitor.example.com"
+# Set this to true only when you intentionally expose the panel over plain HTTP,
+# for example in an isolated test environment without TLS termination.
+insecure_allow_http = false
 node_registry_path = "./config/server.json"
 history_db_path = "./data/history.sqlite3"
 snapshot_path = "./data/snapshot.json"

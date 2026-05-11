@@ -1,22 +1,46 @@
+// 配置文件解析:Agent 与 Server 启动时读取的 TOML 配置。
+//
+// 设计要点:
+// 1. 暴露的 `ServerConfig`/`AgentConfig` 是经过校验的"干净"结构;
+//    原始反序列化用的 `RawXxx` 仅在本模块内可见,以便在 `validate()` 中统一兜底。
+// 2. 所有默认值通过常量 `DEFAULT_*` 暴露,既被本文件的 `default_*` 函数引用,
+//    也被外部代码(例如 history 模块)直接使用,确保各组件的默认值一致。
+// 3. 校验逻辑会拒绝看似合理但运行期会出问题的配置,例如:
+//    - 非回环地址上线却没有配置只读认证;
+//    - 安装基址只给了 base_url 而没给对应的校验和。
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+/// 节点超时阈值:超过该时长未收到任何报文即视为离线。
 pub const DEFAULT_STALE_AFTER_SECS: u64 = 20;
+/// Server 默认 ping 间隔(秒)。
 pub const DEFAULT_PING_INTERVAL_SECS: u64 = 10;
+/// WebSocket 单帧最大字节数,用于抑制恶意大包。
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 64 * 1024;
+/// 前端默认刷新间隔(秒)。
 pub const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 5;
+/// Agent 默认上报间隔(秒)。
 pub const DEFAULT_REPORT_INTERVAL_SECS: u64 = 5;
+/// 历史数据保留时长(小时),默认 14 天。
 pub const DEFAULT_HISTORY_RETENTION_HOURS: u64 = 24 * 14;
+/// 同一节点两次历史写入的最小间隔(秒),降低 SQLite 压力。
 pub const DEFAULT_HISTORY_WRITE_INTERVAL_SECS: u64 = 30;
+/// WebSocket 并发连接总数上限。
 pub const DEFAULT_WS_MAX_TOTAL_CONNECTIONS: usize = 1024;
+/// 单个 IP 允许的 WebSocket 并发连接数。
 pub const DEFAULT_WS_MAX_CONNECTIONS_PER_IP: usize = 32;
+/// 认证失败统计窗口(秒);超出该窗口的失败记录会被丢弃。
 pub const DEFAULT_WS_AUTH_FAIL_WINDOW_SECS: u64 = 300;
+/// 在统计窗口内允许的最大失败次数,达到后触发临时封禁。
 pub const DEFAULT_WS_AUTH_FAIL_MAX_ATTEMPTS: usize = 12;
+/// 触发封禁后的禁用时长(秒)。
 pub const DEFAULT_WS_AUTH_BLOCK_SECS: u64 = 900;
 
+/// 配置加载或校验过程中产生的错误。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigError {
     message: String,
@@ -38,10 +62,12 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// Server 启动需要的全部配置。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServerConfig {
     pub listen: SocketAddr,
     pub public_base_url: String,
+    pub insecure_allow_http: bool,
     pub readonly_auth: Option<ReadonlyAuthConfig>,
     pub ws: WsConfig,
     pub node_registry_path: PathBuf,
@@ -57,12 +83,14 @@ pub struct ServerConfig {
     pub agent_release_sha256_aarch64: Option<String>,
 }
 
+/// 前端只读访问所用的基本认证凭证。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReadonlyAuthConfig {
     pub username: String,
     pub password: String,
 }
 
+/// WebSocket 准入控制参数,用于限流与抗暴力破解。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WsConfig {
     pub max_total_connections: usize,
@@ -72,6 +100,7 @@ pub struct WsConfig {
     pub auth_block_secs: u64,
 }
 
+/// Agent 启动需要的全部配置。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentConfig {
     pub node_id: String,
@@ -83,12 +112,14 @@ pub struct AgentConfig {
     pub tags: Vec<String>,
 }
 
+/// 从 TOML 文本中解析并校验出 `ServerConfig`。
 pub fn parse_server_config(input: &str) -> Result<ServerConfig, ConfigError> {
     let raw: RawServerConfigFile =
         toml::from_str(input).map_err(|error| ConfigError::new(error.to_string()))?;
     raw.validate()
 }
 
+/// 从 TOML 文本中解析并校验出 `AgentConfig`。
 pub fn parse_agent_config(input: &str) -> Result<AgentConfig, ConfigError> {
     let raw: RawAgentConfigFile =
         toml::from_str(input).map_err(|error| ConfigError::new(error.to_string()))?;
@@ -116,6 +147,8 @@ struct RawServerConfigFile {
 struct RawServerSection {
     listen: String,
     public_base_url: String,
+    #[serde(default)]
+    insecure_allow_http: bool,
     #[serde(default = "default_node_registry_path")]
     node_registry_path: PathBuf,
     #[serde(default = "default_history_db_path")]
@@ -223,6 +256,7 @@ struct RawAgentSection {
 }
 
 impl RawServerConfigFile {
+    /// 集中执行所有跨字段、跨小节的语义校验。
     fn validate(self) -> Result<ServerConfig, ConfigError> {
         let listen = self
             .server
@@ -234,6 +268,13 @@ impl RawServerConfigFile {
             &self.server.public_base_url,
             &["http", "https"],
         )?;
+        if uses_insecure_remote_public_base_url(&self.server.public_base_url)
+            && !self.server.insecure_allow_http
+        {
+            return Err(ConfigError::new(
+                "server.insecure_allow_http = true is required when server.public_base_url uses remote http://",
+            ));
+        }
         if let Some(agent_release_base_url) = self.install.agent_release_base_url.as_deref() {
             validate_url(
                 "install.agent_release_base_url",
@@ -262,6 +303,7 @@ impl RawServerConfigFile {
                 "install.agent_release_sha256_x86_64 and install.agent_release_sha256_aarch64 are required when install.agent_release_base_url is configured",
             ));
         }
+        // 用户名与密码必须成对出现:任意一个单独存在都视为配置错误。
         let readonly_auth = match (
             self.auth.username.map(|value| value.trim().to_string()),
             self.auth.password.map(|value| value.trim().to_string()),
@@ -334,6 +376,7 @@ impl RawServerConfigFile {
                 "ui.refresh_interval_secs must be at least 1 second",
             ));
         }
+        // 监听非回环地址时必须配置只读认证,防止公网暴露。
         if readonly_auth.is_none() && !listen.ip().is_loopback() {
             return Err(ConfigError::new(
                 "auth.username and auth.password are required when server.listen is not loopback",
@@ -343,6 +386,7 @@ impl RawServerConfigFile {
         Ok(ServerConfig {
             listen,
             public_base_url: self.server.public_base_url,
+            insecure_allow_http: self.server.insecure_allow_http,
             readonly_auth,
             ws: WsConfig {
                 max_total_connections: self.ws.max_total_connections,
@@ -366,7 +410,32 @@ impl RawServerConfigFile {
     }
 }
 
+fn uses_insecure_remote_public_base_url(public_base_url: &str) -> bool {
+    let Ok(url) = Url::parse(public_base_url) else {
+        return false;
+    };
+    if url.scheme() != "http" {
+        return false;
+    }
+
+    !host_is_local(url.host_str())
+}
+
+fn host_is_local(host: Option<&str>) -> bool {
+    let Some(host) = host else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
 impl RawAgentConfigFile {
+    /// 校验 Agent 配置,并把 `agent.tags` 等字段规范化(去空白、去重、排序)。
     fn validate(self) -> Result<AgentConfig, ConfigError> {
         validate_identifier("agent.node_id", &self.agent.node_id)?;
         validate_non_empty("agent.node_label", &self.agent.node_label)?;
@@ -405,6 +474,7 @@ fn validate_non_empty(field: &str, value: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// 校验"标识符"风格的字段:非空、长度可控、仅含 ASCII 字母数字与 `-_.`。
 fn validate_identifier(field: &str, value: &str) -> Result<(), ConfigError> {
     validate_non_empty(field, value)?;
     if value.len() > 128 {
@@ -423,6 +493,7 @@ fn validate_identifier(field: &str, value: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// 校验 URL 字段:能被解析,并且采用了允许的协议方案。
 fn validate_url(field: &str, value: &str, schemes: &[&str]) -> Result<(), ConfigError> {
     let parsed =
         Url::parse(value).map_err(|error| ConfigError::new(format!("invalid {field}: {error}")))?;
@@ -435,6 +506,7 @@ fn validate_url(field: &str, value: &str, schemes: &[&str]) -> Result<(), Config
     Ok(())
 }
 
+/// 规范化字符串列表:trim 后去空、排序并去重,确保比较与持久化稳定。
 fn normalize_string_list(values: Vec<String>) -> Vec<String> {
     let mut values: Vec<String> = values
         .into_iter()
@@ -446,6 +518,7 @@ fn normalize_string_list(values: Vec<String>) -> Vec<String> {
     values
 }
 
+/// 校验 SHA-256 摘要:长度必须是 64 个十六进制字符。
 fn validate_sha256(field: &str, value: &str) -> Result<(), ConfigError> {
     validate_non_empty(field, value)?;
     if value.len() != 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
@@ -508,6 +581,7 @@ fn default_report_interval_secs() -> u64 {
     DEFAULT_REPORT_INTERVAL_SECS
 }
 
+/// 默认忽略的文件系统类型;这些通常是虚拟挂载,不应在磁盘视图中出现。
 fn default_ignored_filesystems() -> Vec<String> {
     vec![
         "devtmpfs".to_string(),
@@ -538,6 +612,7 @@ mod tests {
         .expect("server config should parse");
 
         assert_eq!(config.listen.to_string(), "127.0.0.1:8080");
+        assert!(!config.insecure_allow_http);
         assert_eq!(config.readonly_auth, None);
         assert_eq!(config.max_message_bytes, DEFAULT_MAX_MESSAGE_BYTES);
         assert_eq!(
@@ -711,5 +786,42 @@ mod tests {
         .expect_err("invalid ws limits should fail");
 
         assert!(error.to_string().contains("ws.max_connections_per_ip"));
+    }
+
+    #[test]
+    fn rejects_remote_http_without_explicit_opt_in() {
+        let error = parse_server_config(
+            r#"
+            [server]
+            listen = "0.0.0.0:8080"
+            public_base_url = "http://monitor.example.com"
+
+            [auth]
+            username = "viewer"
+            password = "secret"
+            "#,
+        )
+        .expect_err("remote http without opt-in should fail");
+
+        assert!(error.to_string().contains("server.insecure_allow_http"));
+    }
+
+    #[test]
+    fn allows_remote_http_with_explicit_opt_in() {
+        let config = parse_server_config(
+            r#"
+            [server]
+            listen = "0.0.0.0:8080"
+            public_base_url = "http://monitor.example.com"
+            insecure_allow_http = true
+
+            [auth]
+            username = "viewer"
+            password = "secret"
+            "#,
+        )
+        .expect("remote http should parse with explicit opt-in");
+
+        assert!(config.insecure_allow_http);
     }
 }
