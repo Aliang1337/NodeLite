@@ -132,7 +132,44 @@ fn init_tracing() {
         .init();
 }
 
+/// 等待 SIGTERM / SIGINT,任一信号到达即返回。
+///
+/// 仅在 unix 上监听 SIGTERM;其它平台只听 Ctrl-C。注册失败时退化为 `pending`,
+/// 保证另一条信号路径仍能触发 —— 不会因为某个 handler 安装失败而吞掉所有信号。
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            warn!(error = ?error, "failed to listen for ctrl-c");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(error) => {
+                warn!(error = ?error, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
+
 /// 无限重连循环:无论会话以何种方式结束,都会按指数退避重试。
+///
+/// 当进程收到 SIGTERM / SIGINT 时立即从当前 await 点退出,使 Agent 能写一条
+/// "shutting down" 日志后干净退出,而不是被 systemd 直接 KILL 截断。
 async fn run_forever(
     config: AgentConfig,
     mut collector: crate::collector::HostCollector,
@@ -141,25 +178,35 @@ async fn run_forever(
     let mut attempt = 0_u32;
 
     loop {
-        match run_session(&config, &mut collector, &identity).await {
-            Ok(()) => {
-                attempt = 0;
-            }
-            Err(error) => {
-                // 已建立过认证会话的失败不计入连续失败次数,避免被偶发网络故障误判为暴力重试。
-                if error.established_session {
+        let next = async {
+            match run_session(&config, &mut collector, &identity).await {
+                Ok(()) => {
                     attempt = 0;
                 }
-                let delay = reconnect_delay(attempt);
-                warn!(
-                    server = %config.server,
-                    delay_secs = delay.as_secs(),
-                    established_session = error.established_session,
-                    error = ?error.source,
-                    "agent session ended; retrying after backoff"
-                );
-                sleep(delay).await;
-                attempt = attempt.saturating_add(1);
+                Err(error) => {
+                    // 已建立过认证会话的失败不计入连续失败次数,避免被偶发网络故障误判为暴力重试。
+                    if error.established_session {
+                        attempt = 0;
+                    }
+                    let delay = reconnect_delay(attempt);
+                    warn!(
+                        server = %config.server,
+                        delay_secs = delay.as_secs(),
+                        established_session = error.established_session,
+                        error = ?error.source,
+                        "agent session ended; retrying after backoff"
+                    );
+                    sleep(delay).await;
+                    attempt = attempt.saturating_add(1);
+                }
+            }
+        };
+
+        tokio::select! {
+            _ = next => continue,
+            _ = shutdown_signal() => {
+                info!("agent shutting down");
+                return Ok(());
             }
         }
     }

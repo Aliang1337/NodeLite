@@ -57,7 +57,7 @@ use crate::registry::{
     IssueNodeRequest, NodeRegistry, build_install_script_url, default_agent_release_base_url,
     issue_node, render_agent_config, render_install_command, render_upgrade_command,
 };
-use crate::snapshot::{load_snapshot, spawn_snapshot_persistor};
+use crate::snapshot::{load_snapshot, persist_snapshot, spawn_snapshot_persistor};
 use crate::state::SharedState;
 use crate::ui::{UI_I18N_JSON, index_html, node_html};
 
@@ -450,6 +450,8 @@ async fn run_server(config_path: &Path) -> Result<()> {
         shared,
         ws_admission: WsAdmissionController::new(&config.ws),
     };
+    let shared_for_shutdown = state.shared.clone();
+    let snapshot_path = config.snapshot_path.clone();
     let protected_routes = Router::new()
         .route("/", get(index))
         .route("/nodes/{node_id}", get(node_detail))
@@ -488,8 +490,19 @@ async fn run_server(config_path: &Path) -> Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await
-    .context("server exited unexpectedly")
+    .context("server exited unexpectedly")?;
+
+    // 周期持久化任务每 15 秒落盘一次,SIGTERM 期间最近一次 tick 之后的状态变更可能
+    // 还没刷到磁盘。这里同步再落一次,确保 systemd restart 后看到的就是退出前最新视图。
+    info!("flushing final snapshot before shutdown");
+    let final_statuses = shared_for_shutdown.list_statuses().await;
+    if let Err(error) = persist_snapshot(snapshot_path.as_path(), &final_statuses).await {
+        warn!(error = ?error, path = %snapshot_path.display(), "failed to flush final snapshot");
+    }
+    info!("ximonitor server shutdown complete");
+    Ok(())
 }
 
 /// `server issue-node`:创建/更新节点并打印对应的 agent.toml 与安装命令。
@@ -1545,6 +1558,40 @@ fn init_tracing() {
         .with_target(false)
         .compact()
         .init();
+}
+
+/// 等待 SIGTERM / SIGINT,任意一个到达即触发 axum 的优雅停机。
+///
+/// 仅在 unix 平台监听 SIGTERM;其它平台只听 Ctrl-C。两路任一就绪都会立即返回,
+/// 因此即便其中一路注册失败也不会阻塞另一路 —— 否则 systemd 的 SIGTERM 会被静默忽略。
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            warn!(error = ?error, "failed to listen for ctrl-c");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(error) => {
+                warn!(error = ?error, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("received SIGINT; initiating graceful shutdown"),
+        _ = terminate => info!("received SIGTERM; initiating graceful shutdown"),
+    }
 }
 
 #[cfg(test)]

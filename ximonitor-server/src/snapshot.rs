@@ -45,7 +45,7 @@ pub fn spawn_snapshot_persistor(shared: SharedState, snapshot_path: PathBuf) {
 }
 
 /// 实际执行"写临时文件 → rename → 设权限"的步骤。
-async fn persist_snapshot(path: &Path, statuses: &[NodeStatus]) -> Result<()> {
+pub(crate) async fn persist_snapshot(path: &Path, statuses: &[NodeStatus]) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {

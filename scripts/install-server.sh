@@ -568,6 +568,7 @@ Type=simple
 ExecStart=$BIN_PATH --config $CONFIG_PATH
 Restart=always
 RestartSec=3
+TimeoutStopSec=15s
 WorkingDirectory=$INSTALL_ROOT
 User=root
 Group=root
