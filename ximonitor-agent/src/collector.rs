@@ -365,6 +365,7 @@ mod imp {
         let content =
             fs::read_to_string(mounts_path).with_context(|| format!("read {mounts_path}"))?;
         let mut seen_mounts = HashSet::new();
+        let mut seen_devices = HashSet::new();
         let mut disks = Vec::new();
 
         for line in content.lines() {
@@ -395,6 +396,10 @@ mod imp {
                 }
             };
             if stats.total_bytes == 0 {
+                continue;
+            }
+            let device_identity = format!("{device}:{}", stats.total_bytes);
+            if !seen_devices.insert(device_identity) {
                 continue;
             }
 

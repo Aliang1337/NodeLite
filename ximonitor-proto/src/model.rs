@@ -84,6 +84,8 @@ pub struct NodeSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeStatus {
     pub identity: NodeIdentity,
+    #[serde(default)]
+    pub remote_ip: Option<String>,
     pub snapshot: Option<NodeSnapshot>,
     pub last_seen: Option<DateTime<Utc>>,
     pub latency_ms: Option<u64>,

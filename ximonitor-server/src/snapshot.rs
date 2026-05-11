@@ -173,6 +173,7 @@ mod tests {
                     boot_time: None,
                     tags: vec!["edge".to_string()],
                 },
+                remote_ip: Some("198.51.100.24".to_string()),
                 snapshot: None,
                 last_seen: Some(Utc::now()),
                 latency_ms: None,

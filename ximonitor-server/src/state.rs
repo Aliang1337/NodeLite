@@ -40,11 +40,11 @@ impl SharedState {
 
     /// 登记一个新的 WebSocket 会话并返回唯一的 `session_id`。
     /// 同一节点重连时会得到比上次更大的 ID,从而抢占老的会话。
-    pub async fn register_node(&self, identity: NodeIdentity) -> u64 {
+    pub async fn register_node(&self, identity: NodeIdentity, remote_ip: Option<String>) -> u64 {
         let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
         let now = Utc::now();
         let mut registry = self.registry.write().await;
-        registry.register_node(session_id, identity, now);
+        registry.register_node(session_id, identity, remote_ip, now);
         session_id
     }
 
@@ -123,11 +123,18 @@ struct NodeEntry {
 }
 
 impl Registry {
-    fn register_node(&mut self, session_id: u64, identity: NodeIdentity, now: DateTime<Utc>) {
+    fn register_node(
+        &mut self,
+        session_id: u64,
+        identity: NodeIdentity,
+        remote_ip: Option<String>,
+        now: DateTime<Utc>,
+    ) {
         let node_id = identity.node_id.clone();
         let entry = self.nodes.entry(node_id).or_insert_with(|| NodeEntry {
             status: NodeStatus {
                 identity: identity.clone(),
+                remote_ip: remote_ip.clone(),
                 snapshot: None,
                 last_seen: Some(now),
                 latency_ms: None,
@@ -138,6 +145,7 @@ impl Registry {
 
         // 已存在的节点也要把身份与会话 ID 刷新成"最新连接"的版本。
         entry.status.identity = identity;
+        entry.status.remote_ip = remote_ip;
         entry.status.online = true;
         entry.status.last_seen = Some(now);
         entry.status.latency_ms = None;
@@ -347,8 +355,13 @@ mod tests {
             tags: Vec::new(),
         };
 
-        registry.register_node(1, identity.clone(), now);
-        registry.register_node(2, identity, now + ChronoDuration::seconds(3));
+        registry.register_node(1, identity.clone(), Some("198.51.100.10".to_string()), now);
+        registry.register_node(
+            2,
+            identity,
+            Some("198.51.100.11".to_string()),
+            now + ChronoDuration::seconds(3),
+        );
 
         assert!(
             registry
@@ -372,7 +385,7 @@ mod tests {
         let mut registry = Registry::default();
         let now = Utc.with_ymd_and_hms(2026, 5, 7, 0, 0, 0).unwrap();
 
-        registry.register_node(7, sample_identity(), now);
+        registry.register_node(7, sample_identity(), Some("198.51.100.10".to_string()), now);
         assert_eq!(
             registry.mark_stale(Duration::from_secs(10), now + ChronoDuration::seconds(15)),
             1
@@ -391,7 +404,7 @@ mod tests {
         let mut registry = Registry::default();
         let now = Utc.with_ymd_and_hms(2026, 5, 7, 0, 0, 0).unwrap();
 
-        registry.register_node(1, sample_identity(), now);
+        registry.register_node(1, sample_identity(), Some("198.51.100.10".to_string()), now);
         registry.register_node(
             2,
             NodeIdentity {
@@ -399,6 +412,7 @@ mod tests {
                 node_label: "Singapore 01".to_string(),
                 ..sample_identity()
             },
+            Some("198.51.100.11".to_string()),
             now,
         );
 
@@ -430,7 +444,7 @@ mod tests {
         let mut registry = Registry::default();
         let now = Utc.with_ymd_and_hms(2026, 5, 7, 0, 0, 0).unwrap();
 
-        registry.register_node(1, sample_identity(), now);
+        registry.register_node(1, sample_identity(), Some("198.51.100.10".to_string()), now);
         registry.register_node(
             2,
             NodeIdentity {
@@ -438,6 +452,7 @@ mod tests {
                 node_label: "Singapore 01".to_string(),
                 ..sample_identity()
             },
+            Some("198.51.100.11".to_string()),
             now,
         );
 

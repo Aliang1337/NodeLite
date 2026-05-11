@@ -525,6 +525,7 @@ mod tests {
                 boot_time: None,
                 tags: vec!["edge".to_string()],
             },
+            remote_ip: Some("198.51.100.24".to_string()),
             snapshot: Some(NodeSnapshot {
                 collected_at: now + Duration::hours(24),
                 cpu_usage_percent: 42.0,

@@ -17,7 +17,7 @@ mod snapshot;
 mod state;
 mod ui;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -927,7 +927,9 @@ async fn handle_socket(
 
     let node_id = identity.node_id.clone();
     let node_label = identity.node_label.clone();
-    let session_id = shared.register_node(identity).await;
+    let session_id = shared
+        .register_node(identity, Some(client_ip.to_string()))
+        .await;
 
     info!(node_id = %node_id, node_label = %node_label, session_id, "node authenticated");
 
@@ -1327,6 +1329,7 @@ fn sanitize_snapshot(
     snapshot.memory = sanitize_memory_usage(snapshot.memory, &mut report);
     snapshot.network = sanitize_network_counters(snapshot.network, &mut report);
     let mut sanitized_disks = Vec::new();
+    let mut seen_disk_devices = HashSet::new();
     for disk in snapshot.disks {
         if config
             .ignored_filesystems
@@ -1339,6 +1342,11 @@ fn sanitize_snapshot(
         let Some(disk) = sanitize_disk_usage(disk, &mut report) else {
             continue;
         };
+        let disk_identity = disk_device_identity(&disk);
+        if !seen_disk_devices.insert(disk_identity) {
+            report.dropped_disks = report.dropped_disks.saturating_add(1);
+            continue;
+        }
         if sanitized_disks.len() >= MAX_SANITIZED_DISKS {
             report.dropped_disks = report.dropped_disks.saturating_add(1);
             continue;
@@ -1490,6 +1498,10 @@ fn sanitize_disk_usage(mut disk: DiskUsage, report: &mut SanitizationReport) -> 
         &mut report.clamped_percents,
     );
     Some(disk)
+}
+
+fn disk_device_identity(disk: &DiskUsage) -> String {
+    format!("{}:{}", disk.device, disk.total_bytes)
 }
 
 fn sanitize_network_counters(
@@ -2098,6 +2110,92 @@ mod tests {
         assert!(should_disconnect_for_metric_anomalies(
             METRIC_ANOMALY_SESSION_LIMIT
         ));
+    }
+
+    #[test]
+    fn sanitize_snapshot_deduplicates_repeated_disk_devices() {
+        let config = ServerConfig {
+            listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080)),
+            public_base_url: "http://127.0.0.1:8080".to_string(),
+            insecure_allow_http: false,
+            readonly_auth: None,
+            ws: WsConfig {
+                max_total_connections: 32,
+                max_connections_per_ip: 8,
+                auth_fail_window_secs: 300,
+                auth_fail_max_attempts: 6,
+                auth_block_secs: 600,
+            },
+            node_registry_path: PathBuf::from("./data/server.json"),
+            history_db_path: PathBuf::from("./data/history.sqlite3"),
+            snapshot_path: PathBuf::from("./data/snapshot.json"),
+            stale_after_secs: 15,
+            ping_interval_secs: 5,
+            max_message_bytes: 64 * 1024,
+            refresh_interval_secs: 5,
+            ignored_filesystems: Vec::new(),
+            agent_release_base_url: None,
+            agent_release_sha256_x86_64: None,
+            agent_release_sha256_aarch64: None,
+        };
+        let snapshot = NodeSnapshot {
+            collected_at: Utc::now(),
+            cpu_usage_percent: 1.0,
+            load: ximonitor_proto::LoadAverage {
+                one: 0.1,
+                five: 0.1,
+                fifteen: 0.1,
+            },
+            memory: ximonitor_proto::MemoryUsage {
+                total_bytes: 100,
+                used_bytes: 50,
+                available_bytes: 50,
+                swap_total_bytes: 0,
+                swap_used_bytes: 0,
+            },
+            uptime_secs: 60,
+            disks: vec![
+                ximonitor_proto::DiskUsage {
+                    device: "/dev/vda1".to_string(),
+                    mount_point: "/".to_string(),
+                    fs_type: "ext4".to_string(),
+                    total_bytes: 100,
+                    available_bytes: 40,
+                    used_bytes: 60,
+                    used_percent: 60.0,
+                },
+                ximonitor_proto::DiskUsage {
+                    device: "/dev/vda1".to_string(),
+                    mount_point: "/var".to_string(),
+                    fs_type: "ext4".to_string(),
+                    total_bytes: 100,
+                    available_bytes: 40,
+                    used_bytes: 60,
+                    used_percent: 60.0,
+                },
+                ximonitor_proto::DiskUsage {
+                    device: "/dev/vdb".to_string(),
+                    mount_point: "/ssd".to_string(),
+                    fs_type: "ext4".to_string(),
+                    total_bytes: 200,
+                    available_bytes: 100,
+                    used_bytes: 100,
+                    used_percent: 50.0,
+                },
+            ],
+            network: ximonitor_proto::NetworkCounters {
+                total_rx_bytes: 1,
+                total_tx_bytes: 2,
+                rx_bytes_per_sec: Some(3.0),
+                tx_bytes_per_sec: Some(4.0),
+            },
+        };
+
+        let (sanitized, report) = sanitize_snapshot(&config, snapshot);
+        assert_eq!(sanitized.disks.len(), 2);
+        assert_eq!(sanitized.disks[0].mount_point, "/");
+        assert_eq!(sanitized.disks[1].mount_point, "/ssd");
+        assert_eq!(report.dropped_disks, 1);
     }
 
     #[test]
