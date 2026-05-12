@@ -314,7 +314,7 @@
         min-height: 160px;
         margin-top: 8px;
         position: relative;
-        overflow: hidden;
+        overflow: visible;
       }
       .chart-stage svg { width: 100%; height: 100%; display: block; }
       .chart-tooltip {
@@ -749,7 +749,7 @@
                 <button type="button" class="chart-clip-toggle" data-clip-chart="latency"></button>
               </div>
               <div class="value" id="latency-value">--</div>
-              <div class="chart-stage" style="min-height:50px;margin-top:0" id="chart-rtt"></div>
+              <div class="chart-stage" style="min-height:96px;margin-top:0" id="chart-rtt"></div>
             </article>
           </div>
         </section>
@@ -1372,8 +1372,14 @@
           height: Math.max(64, Math.round(measuredHeight || options.height || 180)),
         };
       }
+      function chartPadLeft(kind) {
+        if (kind === "rate") return 86;
+        if (kind === "latency") return 70;
+        return 62;
+      }
       function chartGridMarkup(bounds, width, height, padLeft, padRight, padTop, padBottom, kind) {
-        const ticks = [0, 0.25, 0.5, 0.75, 1].map((ratio) => bounds.displayMin + (bounds.displayMax - bounds.displayMin) * ratio);
+        const ratios = height < 100 ? [0, 0.5, 1] : [0, 0.25, 0.5, 0.75, 1];
+        const ticks = ratios.map((ratio) => bounds.displayMin + (bounds.displayMax - bounds.displayMin) * ratio);
         return ticks.map((tick) => {
           const y = chartY(tick, bounds, height, padTop, padBottom);
           return `
@@ -1385,11 +1391,15 @@
       function averageLineMarkup(points, bounds, width, height, padLeft, padRight, padTop, padBottom, color, kind, opacity = 0.36) {
         const avg = averageValue(points);
         if (avg == null) return "";
-        const y = chartY(avg, bounds, height, padTop, padBottom);
+        const lineY = chartY(avg, bounds, height, padTop, padBottom);
+        const labelY = Math.min(height - padBottom - 10, Math.max(padTop + 12, lineY));
         const label = escapeHtml(formatChartValue(avg, kind));
+        const labelWidth = Math.max(40, Math.min(86, label.length * 6.4 + 12));
+        const labelX = width - padRight - labelWidth - 2;
         return `
-          <line x1="${padLeft}" x2="${width - padRight}" y1="${y.toFixed(1)}" y2="${y.toFixed(1)}" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.2" stroke-dasharray="6 5" />
-          <text x="${width - padRight - 4}" y="${(y - 4).toFixed(1)}" text-anchor="end" fill="${color}" opacity="0.78" font-size="11">${label}</text>
+          <line x1="${padLeft}" x2="${width - padRight}" y1="${lineY.toFixed(1)}" y2="${lineY.toFixed(1)}" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.2" stroke-dasharray="6 5" />
+          <rect x="${labelX.toFixed(1)}" y="${(labelY - 15).toFixed(1)}" width="${labelWidth.toFixed(1)}" height="17" rx="8.5" fill="var(--bg-card)" opacity="0.88" />
+          <text x="${(labelX + labelWidth - 6).toFixed(1)}" y="${(labelY - 3).toFixed(1)}" text-anchor="end" fill="${color}" opacity="0.88" font-size="11">${label}</text>
         `;
       }
       function installChartHover(root, plot) {
@@ -1437,9 +1447,10 @@
             `).join("")}
           `;
           const tooltipLeft = Math.min(rect.width - 74, Math.max(74, (anchor.x / plot.width) * rect.width));
-          const tooltipTop = Math.max(34, (Math.min(...matches.map((item) => item.point.y)) / plot.height) * rect.height);
+          const tooltipTop = Math.max(10, (Math.min(...matches.map((item) => item.point.y)) / plot.height) * rect.height);
           tooltip.style.left = `${tooltipLeft}px`;
           tooltip.style.top = `${tooltipTop}px`;
+          tooltip.style.transform = tooltipTop < 88 ? "translate(-50%, 14px)" : "translate(-50%, calc(-100% - 10px))";
           tooltip.hidden = false;
           layer.setAttribute("opacity", "1");
         };
@@ -1484,7 +1495,7 @@
         const kind = options.valueKind || "number";
         const bounds = chartDisplayBounds(values, options);
         const { width, height } = chartDimensions(root, options);
-        const padLeft = options.padLeft || 56;
+        const padLeft = options.padLeft || chartPadLeft(kind);
         const padRight = 14;
         const padTop = 12;
         const padBottom = 20;
@@ -1538,7 +1549,7 @@
         const kind = options.valueKind || "number";
         const bounds = chartDisplayBounds(allValues.map(Number), options);
         const { width, height } = chartDimensions(root, options);
-        const padLeft = options.padLeft || 56;
+        const padLeft = options.padLeft || chartPadLeft(kind);
         const padRight = 14;
         const padTop = 12;
         const padBottom = 20;
