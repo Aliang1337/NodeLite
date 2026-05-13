@@ -147,6 +147,11 @@ struct TwoFactorSessions {
 struct TwoFactorSessionStore {
     pending: HashMap<String, PendingSession>,
     authenticated: HashMap<String, Instant>,
+    /// 最近被成功消费过的 TOTP `time_step`(30 秒一个步长)。一旦某个 step
+    /// 被用过,即便它落在当前 ±1 漂移窗口里也必须拒绝,以阻止攻击者捕获
+    /// 一次 verify 请求后在同窗口内重放。条目在该 step 完全离开漂移窗口
+    /// 后被 prune 清掉,避免无界增长。
+    used_totp_steps: HashMap<u64, Instant>,
 }
 
 /// 一条待二次验证的会话:除了过期时间,还跟踪该 pending token 的连续失败
@@ -345,6 +350,10 @@ const TWO_FACTOR_AUTH_SECS: u64 = 24 * 60 * 60;
 /// 这与 `InstallAdmissionController` 的 IP 维度限流共同把 TOTP 暴力破解
 /// 的代价压到不可接受的水平。
 const TWO_FACTOR_MAX_FAILED_ATTEMPTS: u32 = 5;
+/// 成功消费过的 TOTP `time_step` 在 store 中保留的时长。RFC 6238 §5.2
+/// 要求拒绝同一 step 的重复使用;我们用 90 秒(覆盖 ±1 漂移窗口的极限,
+/// 即"上一步刚被使用 → 时钟回退后仍可能落在合法窗口")完整保护一次步进。
+const TWO_FACTOR_TOTP_REPLAY_RETENTION_SECS: u64 = 90;
 const TWO_FACTOR_PENDING_COOKIE: &str = "ximonitor_2fa_pending";
 const TWO_FACTOR_AUTH_COOKIE: &str = "ximonitor_auth";
 /// Token 距离过期不足该天数时,服务端在已认证会话内主动轮换并下发新 token。
@@ -484,6 +493,22 @@ impl TwoFactorSessions {
         false
     }
 
+    /// 标记某个 TOTP `time_step` 已经被成功消费过;同一个 step 再次出现时,
+    /// `is_totp_step_used` 会返回 true,从而拒绝重放。
+    /// 标记会在该 step 离开 ±1 漂移窗口后自动过期。
+    fn mark_totp_step_used(&self, step: u64) {
+        let mut store = lock_mutex(&self.inner);
+        prune_expired_sessions(&mut store, Instant::now());
+        let expires_at = Instant::now() + Duration::from_secs(TWO_FACTOR_TOTP_REPLAY_RETENTION_SECS);
+        store.used_totp_steps.insert(step, expires_at);
+    }
+
+    fn is_totp_step_used(&self, step: u64) -> bool {
+        let mut store = lock_mutex(&self.inner);
+        prune_expired_sessions(&mut store, Instant::now());
+        store.used_totp_steps.contains_key(&step)
+    }
+
     fn create_authenticated(&self) -> Result<String> {
         let token = generate_session_token()?;
         let expires_at = Instant::now() + Duration::from_secs(TWO_FACTOR_AUTH_SECS);
@@ -511,6 +536,9 @@ fn prune_expired_sessions(store: &mut TwoFactorSessionStore, now: Instant) {
         .retain(|_, session| session.expires_at > now);
     store
         .authenticated
+        .retain(|_, expires_at| *expires_at > now);
+    store
+        .used_totp_steps
         .retain(|_, expires_at| *expires_at > now);
 }
 
@@ -1023,8 +1051,13 @@ async fn verify_2fa_api(
         ));
     }
 
-    // 验证 TOTP 码
-    if !verify_totp(&state, &request.code) {
+    // 验证 TOTP 码并解析出匹配到的 time_step
+    let totp_step = verify_totp_step(&state, &request.code);
+    // Replay 检查:即便 code 数学上正确,如果它对应的 step 已经被消费过,
+    // 同样按"验证失败"处理 —— 否则攻击者捕获一次合法 verify 请求后,
+    // 可以在同一 30 秒窗口内换一个 pending session 重发同一 code。
+    let totp_step = totp_step.filter(|step| !state.two_factor_sessions.is_totp_step_used(*step));
+    if totp_step.is_none() {
         let pending_invalidated = state
             .two_factor_sessions
             .record_failed_attempt(&pending_token);
@@ -1047,6 +1080,9 @@ async fn verify_2fa_api(
         };
         return Ok(response);
     }
+    let totp_step = totp_step.expect("checked Some above");
+    // 标记 step 已被使用,阻断未来 90 秒内同 step 的重放。
+    state.two_factor_sessions.mark_totp_step_used(totp_step);
 
     let auth_token = state
         .two_factor_sessions
@@ -1079,34 +1115,52 @@ async fn verify_2fa_api(
         .into_response())
 }
 
-/// 验证 TOTP 码是否正确。
-fn verify_totp(state: &AppState, code: &str) -> bool {
-    let Some(ref secret) = state.readonly_auth.totp_secret else {
-        return false;
-    };
+/// 验证 TOTP 码并返回匹配到的 30 秒 `time_step`。允许 ±1 个步长的时钟漂移。
+///
+/// 调用方收到 `Some(step)` 后需要进一步检查该 step 是否已经被消费过
+/// (`TwoFactorSessions::is_totp_step_used`),以满足 RFC 6238 §5.2 的
+/// "同一步骤的代码不允许重复使用"要求。
+fn verify_totp_step(state: &AppState, code: &str) -> Option<u64> {
+    let secret = state.readonly_auth.totp_secret.as_ref()?;
 
-    // 验证码必须是 6 位数字
-    if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
-        return false;
+    // 验证码必须正好 6 位 ASCII 数字。
+    if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
 
-    // 获取当前时间戳 (30 秒为一个周期)
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    // 时钟回拨到 1970 之前 chrono 会返回负值;退化到 0 而不是 panic。
+    let now_secs = Utc::now().timestamp().max(0) as u64;
+    let now_step = now_secs / 30;
 
-    // 验证当前时间窗口及前后各一个窗口 (允许 ±30 秒时钟偏差)
-    for time_offset in [-1, 0, 1] {
-        let time_step = (now as i64 + time_offset * 30) as u64 / 30;
-        let expected = totp_custom::<Sha1>(30, 6, secret, time_step);
-        let expected_str = format!("{:06}", expected);
-        if expected_str == code {
-            return true;
+    for offset in [-1_i64, 0, 1] {
+        let step = if offset < 0 {
+            now_step.checked_sub(offset.unsigned_abs())
+        } else {
+            now_step.checked_add(offset as u64)
+        };
+        let Some(step) = step else { continue };
+        let expected = totp_custom::<Sha1>(30, 6, secret, step);
+        let expected_str = format!("{expected:06}");
+        if constant_time_compare_bytes(expected_str.as_bytes(), code.as_bytes()) {
+            return Some(step);
         }
     }
 
-    false
+    None
+}
+
+/// 长度 + 内容都按常量时间比较,避免依据"首个不同字节位置"做旁路。
+/// 在 verify_totp_step 的调用点两边都已经被检查为 6 字节,但保留通用实现
+/// 以便未来其它处复用。
+fn constant_time_compare_bytes(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = left.len() ^ right.len();
+    let max_len = left.len().max(right.len());
+    for index in 0..max_len {
+        let l = usize::from(*left.get(index).unwrap_or(&0));
+        let r = usize::from(*right.get(index).unwrap_or(&0));
+        diff |= l ^ r;
+    }
+    diff == 0
 }
 
 fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -2548,6 +2602,27 @@ mod tests {
         // 已经被失效的 token 再次记录失败时,应当也返回 true(等同已失效),
         // 防止调用方因为找不到 pending 而漏掉"通知客户端清 cookie"的动作。
         assert!(sessions.record_failed_attempt(&token));
+    }
+
+    #[test]
+    fn totp_step_marked_used_blocks_replay() {
+        let sessions = TwoFactorSessions::new();
+        let step = 12345_u64;
+        assert!(!sessions.is_totp_step_used(step));
+        sessions.mark_totp_step_used(step);
+        assert!(sessions.is_totp_step_used(step));
+        // 不同 step 不会被误判
+        assert!(!sessions.is_totp_step_used(step + 1));
+        assert!(!sessions.is_totp_step_used(step - 1));
+    }
+
+    #[test]
+    fn constant_time_compare_matches_only_identical_byte_slices() {
+        assert!(super::constant_time_compare_bytes(b"abc123", b"abc123"));
+        assert!(!super::constant_time_compare_bytes(b"abc123", b"abc124"));
+        assert!(!super::constant_time_compare_bytes(b"abc", b"abc1"));
+        assert!(!super::constant_time_compare_bytes(b"", b"a"));
+        assert!(super::constant_time_compare_bytes(b"", b""));
     }
 
     #[test]
