@@ -22,7 +22,7 @@ use getrandom::fill as fill_random;
 use serde::{Deserialize, Serialize};
 use totp_lite::{Sha1, totp_custom};
 use tracing::warn;
-use ximonitor_proto::{ReadonlyAuthConfig, ServerConfig};
+use ximonitor_proto::{ReadonlyAuthConfig, ServerConfig, normalize_totp_secret};
 
 /// Basic Auth 通过后等待输入 TOTP 的窗口。
 pub const TWO_FACTOR_PENDING_SECS: u64 = 300;
@@ -262,7 +262,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 pub fn decode_totp_secret(value: &str) -> Option<Vec<u8>> {
-    let normalized = value.replace(' ', "").to_ascii_uppercase();
+    let normalized = normalize_totp_secret(value);
     base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &normalized)
         .or_else(|| base32::decode(base32::Alphabet::Rfc4648 { padding: true }, &normalized))
 }

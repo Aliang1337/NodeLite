@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use url::Url;
+use url::{Url, form_urlencoded};
 
 /// 节点超时阈值:超过该时长未收到任何报文即视为离线。
 pub const DEFAULT_STALE_AFTER_SECS: u64 = 20;
@@ -311,7 +311,10 @@ impl RawServerConfigFile {
             ));
         }
         let enable_2fa = self.auth.enable_2fa;
-        let totp_secret = self.auth.totp_secret.map(|value| value.trim().to_string());
+        let totp_secret = self
+            .auth
+            .totp_secret
+            .map(|value| normalize_totp_secret(&value));
         if enable_2fa && self.auth.username.is_none() {
             return Err(ConfigError::new(
                 "auth.username and auth.password are required when auth.enable_2fa = true",
@@ -566,11 +569,53 @@ fn validate_sha256(field: &str, value: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// 兼容常见的 TOTP secret 输入形式:
+/// - 纯 RFC4648 Base32
+/// - 带空格/连字符/小写的手工录入
+/// - 直接粘贴 `otpauth://...?...secret=...`
+/// - 只粘贴 `secret=...` 这样的查询片段
+pub fn normalize_totp_secret(value: &str) -> String {
+    let candidate =
+        extract_totp_secret_candidate(value).unwrap_or_else(|| value.trim().to_string());
+    candidate
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace() && *ch != '-')
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
+fn extract_totp_secret_candidate(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if let Ok(url) = Url::parse(trimmed)
+        && url.scheme().eq_ignore_ascii_case("otpauth")
+    {
+        return extract_secret_query_value(url.query().unwrap_or_default());
+    }
+
+    if trimmed.contains("secret=") {
+        return extract_secret_query_value(trimmed.trim_start_matches('?'));
+    }
+
+    None
+}
+
+fn extract_secret_query_value(query: &str) -> Option<String> {
+    form_urlencoded::parse(query.as_bytes()).find_map(|(key, value)| {
+        key.eq_ignore_ascii_case("secret")
+            .then(|| value.into_owned())
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
+fn decode_totp_secret_bytes(value: &str) -> Option<Vec<u8>> {
+    let normalized = normalize_totp_secret(value);
+    base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &normalized)
+        .or_else(|| base32::decode(base32::Alphabet::Rfc4648 { padding: true }, &normalized))
+}
+
 fn validate_totp_secret(field: &str, value: &str) -> Result<(), ConfigError> {
     validate_non_empty(field, value)?;
-    let normalized = value.replace(' ', "").to_ascii_uppercase();
-    let decoded = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &normalized)
-        .or_else(|| base32::decode(base32::Alphabet::Rfc4648 { padding: true }, &normalized));
+    let decoded = decode_totp_secret_bytes(value);
     let Some(decoded) = decoded else {
         return Err(ConfigError::new(format!(
             "{field} must be a valid RFC4648 base32 TOTP secret"
@@ -813,6 +858,48 @@ mod tests {
 
         let auth = config.readonly_auth.expect("auth should be configured");
         assert!(auth.enable_2fa);
+        assert_eq!(auth.totp_secret.as_deref(), Some("JBSWY3DPEHPK3PXP"));
+    }
+
+    #[test]
+    fn parses_server_config_with_otpauth_totp_secret() {
+        let config = parse_server_config(
+            r#"
+            [server]
+            listen = "127.0.0.1:8080"
+            public_base_url = "https://monitor.example.com"
+
+            [auth]
+            username = "viewer"
+            password = "secret123"
+            enable_2fa = true
+            totp_secret = "otpauth://totp/XiMonitor:viewer%40example.com?secret=jbsw y3dp-ehpk3pxp&issuer=XiMonitor"
+            "#,
+        )
+        .expect("otpauth uri should parse");
+
+        let auth = config.readonly_auth.expect("auth should be configured");
+        assert_eq!(auth.totp_secret.as_deref(), Some("JBSWY3DPEHPK3PXP"));
+    }
+
+    #[test]
+    fn parses_server_config_with_secret_query_totp_secret() {
+        let config = parse_server_config(
+            r#"
+            [server]
+            listen = "127.0.0.1:8080"
+            public_base_url = "https://monitor.example.com"
+
+            [auth]
+            username = "viewer"
+            password = "secret123"
+            enable_2fa = true
+            totp_secret = "secret=jbswy3dp ehpk3pxp&issuer=XiMonitor"
+            "#,
+        )
+        .expect("secret query string should parse");
+
+        let auth = config.readonly_auth.expect("auth should be configured");
         assert_eq!(auth.totp_secret.as_deref(), Some("JBSWY3DPEHPK3PXP"));
     }
 
