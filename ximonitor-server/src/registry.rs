@@ -24,6 +24,7 @@ use tokio::sync::RwLock;
 use url::Url;
 use ximonitor_proto::{MAX_NODE_TAG_BYTES, MAX_NODE_TAGS, NodeIdentity};
 
+use crate::auth::constant_time_compare_bytes;
 use crate::fs_security::{create_private_dir_all, ensure_directory_mode};
 
 #[cfg(unix)]
@@ -799,19 +800,7 @@ fn is_token_current(entries: &HashMap<String, RegisteredNode>, node_id: &str, to
 
 /// 常量时间字符串比较,用于 token 校验,避免基于响应耗时的旁路攻击。
 fn constant_time_eq(left: &str, right: &str) -> bool {
-    // 让 token 比较的耗时与"在哪个字节最早出现差异"无关。
-    let left = left.as_bytes();
-    let right = right.as_bytes();
-    let mut diff = left.len() ^ right.len();
-    let max_len = left.len().max(right.len());
-
-    for index in 0..max_len {
-        let left_byte = usize::from(*left.get(index).unwrap_or(&0));
-        let right_byte = usize::from(*right.get(index).unwrap_or(&0));
-        diff |= left_byte ^ right_byte;
-    }
-
-    diff == 0
+    constant_time_compare_bytes(left.as_bytes(), right.as_bytes())
 }
 
 struct RegistryFileLock {

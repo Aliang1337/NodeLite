@@ -20,6 +20,7 @@ use base64::Engine;
 use chrono::Utc;
 use getrandom::fill as fill_random;
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use totp_lite::{Sha1, totp_custom};
 use tracing::warn;
 use ximonitor_proto::{ReadonlyAuthConfig, ServerConfig, normalize_totp_secret};
@@ -311,14 +312,7 @@ fn totp_code_for_step(secret: &[u8], step: u64) -> String {
 /// 在 verify_totp_step 的调用点两边都已经被检查为 6 字节,但保留通用实现
 /// 以便未来其它处复用。
 pub fn constant_time_compare_bytes(left: &[u8], right: &[u8]) -> bool {
-    let mut diff = left.len() ^ right.len();
-    let max_len = left.len().max(right.len());
-    for index in 0..max_len {
-        let l = usize::from(*left.get(index).unwrap_or(&0));
-        let r = usize::from(*right.get(index).unwrap_or(&0));
-        diff |= l ^ r;
-    }
-    diff == 0
+    left.ct_eq(right).into()
 }
 
 pub fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
