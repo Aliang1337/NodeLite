@@ -8,6 +8,7 @@
 //! 运行方式:
 //! `cargo test -p ximonitor-server load_test_scaling_scores -- --ignored --nocapture`
 //! `cargo test -p ximonitor-server load_test_api_surface_scores -- --ignored --nocapture`
+//! `cargo test -p ximonitor-server load_test_reconnect_storm_scores -- --ignored --nocapture`
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -53,6 +54,10 @@ const LOAD_TEST_READ_PROBES: usize = 20;
 const LOAD_TEST_HISTORY_POINTS: usize = 360;
 const LOAD_TEST_STEADY_METRICS_PER_NODE: u64 = 18;
 const LOAD_TEST_STEADY_METRIC_DELAY_MS: u64 = 15;
+const LOAD_TEST_STORM_CYCLES: usize = 4;
+const LOAD_TEST_STORM_METRICS_PER_CYCLE: u64 = 6;
+const LOAD_TEST_STORM_METRIC_DELAY_MS: u64 = 10;
+const LOAD_TEST_STORM_READ_PROBES: usize = 12;
 const LOAD_TEST_BASIC_AUTH: &str = "Basic dmlld2VyOnNlY3JldA==";
 
 #[derive(Debug, Clone)]
@@ -88,6 +93,18 @@ struct ApiScenarioResult {
     history_api: LatencySummary,
 }
 
+#[derive(Debug)]
+struct StormScenarioResult {
+    nodes: usize,
+    cycles: usize,
+    sessions_total: usize,
+    connect: LatencySummary,
+    recover: LatencySummary,
+    disconnect: LatencySummary,
+    overview: LatencySummary,
+    nodes_api: LatencySummary,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LatencySummary {
     p50_ms: f64,
@@ -97,9 +114,13 @@ struct LatencySummary {
 
 #[derive(Debug, Clone, Copy)]
 struct AgentWorkload {
+    uptime_start: u64,
     metrics_per_node: u64,
     inter_message_delay: Duration,
+    hold_after_send: Duration,
 }
+
+type TestSocket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 
 struct TestServer {
     addr: SocketAddr,
@@ -274,6 +295,14 @@ async fn load_test_api_surface_scores() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "manual load test; run with -- --ignored --nocapture"]
+async fn load_test_reconnect_storm_scores() {
+    if let Err(error) = run_reconnect_storm_load_test().await {
+        panic!("{error:#}");
+    }
+}
+
 async fn run_scaling_load_test() -> Result<()> {
     let scenarios = [20_usize, 50, 100, 200];
     println!(
@@ -333,6 +362,42 @@ async fn run_api_surface_load_test() -> Result<()> {
     Ok(())
 }
 
+async fn run_reconnect_storm_load_test() -> Result<()> {
+    let scenarios = [20_usize, 50, 100, 200];
+    println!(
+        "STORM_LOAD_TEST starting scenarios={:?} cycles={} metrics_per_cycle={} read_probes_per_cycle={}",
+        scenarios,
+        LOAD_TEST_STORM_CYCLES,
+        LOAD_TEST_STORM_METRICS_PER_CYCLE,
+        LOAD_TEST_STORM_READ_PROBES,
+    );
+    for &node_count in &scenarios {
+        let result = run_reconnect_storm_scenario(node_count).await?;
+        println!(
+            "STORM_RESULT nodes={} cycles={} sessions_total={} connect_p50_ms={:.2} connect_p95_ms={:.2} connect_max_ms={:.2} recover_p50_ms={:.2} recover_p95_ms={:.2} recover_max_ms={:.2} disconnect_p50_ms={:.2} disconnect_p95_ms={:.2} disconnect_max_ms={:.2} overview_p50_ms={:.2} overview_p95_ms={:.2} overview_max_ms={:.2} nodes_p50_ms={:.2} nodes_p95_ms={:.2} nodes_max_ms={:.2}",
+            result.nodes,
+            result.cycles,
+            result.sessions_total,
+            result.connect.p50_ms,
+            result.connect.p95_ms,
+            result.connect.max_ms,
+            result.recover.p50_ms,
+            result.recover.p95_ms,
+            result.recover.max_ms,
+            result.disconnect.p50_ms,
+            result.disconnect.p95_ms,
+            result.disconnect.max_ms,
+            result.overview.p50_ms,
+            result.overview.p95_ms,
+            result.overview.max_ms,
+            result.nodes_api.p50_ms,
+            result.nodes_api.p95_ms,
+            result.nodes_api.max_ms,
+        );
+    }
+    Ok(())
+}
+
 async fn run_single_scenario(node_count: usize) -> Result<ScenarioResult> {
     let (server, credentials) = TestServer::start(node_count).await?;
     let (ready_tx, mut ready_rx) = mpsc::unbounded_channel::<String>();
@@ -342,8 +407,10 @@ async fn run_single_scenario(node_count: usize) -> Result<ScenarioResult> {
     let expected_final_uptime = LOAD_TEST_METRICS_PER_NODE;
     let connect_started = Instant::now();
     let workload = AgentWorkload {
+        uptime_start: 1,
         metrics_per_node: LOAD_TEST_METRICS_PER_NODE,
         inter_message_delay: Duration::ZERO,
+        hold_after_send: Duration::ZERO,
     };
 
     for credential in credentials.clone() {
@@ -385,6 +452,7 @@ async fn run_single_scenario(node_count: usize) -> Result<ScenarioResult> {
         &credentials,
         expected_final_uptime,
         Duration::from_secs(LOAD_TEST_TIMEOUT_SECS),
+        true,
     )
     .await?;
     let settle_elapsed = settle_started.elapsed();
@@ -434,8 +502,10 @@ async fn run_api_surface_scenario(node_count: usize) -> Result<ApiScenarioResult
     let burst_barrier = Arc::new(Barrier::new(node_count + 1));
     let mut handles = Vec::with_capacity(node_count);
     let workload = AgentWorkload {
+        uptime_start: 1,
         metrics_per_node: LOAD_TEST_STEADY_METRICS_PER_NODE,
         inter_message_delay: Duration::from_millis(LOAD_TEST_STEADY_METRIC_DELAY_MS),
+        hold_after_send: Duration::ZERO,
     };
     let expected_final_uptime = workload.metrics_per_node;
     let connect_started = Instant::now();
@@ -494,6 +564,7 @@ async fn run_api_surface_scenario(node_count: usize) -> Result<ApiScenarioResult
         &credentials,
         expected_final_uptime,
         Duration::from_secs(LOAD_TEST_TIMEOUT_SECS),
+        true,
     )
     .await?;
     let settle_elapsed = settle_started.elapsed();
@@ -545,6 +616,120 @@ async fn run_api_surface_scenario(node_count: usize) -> Result<ApiScenarioResult
     })
 }
 
+async fn run_reconnect_storm_scenario(node_count: usize) -> Result<StormScenarioResult> {
+    let (server, credentials) = TestServer::start(node_count).await?;
+    let mut connect_latencies = Vec::with_capacity(LOAD_TEST_STORM_CYCLES);
+    let mut recover_latencies = Vec::with_capacity(LOAD_TEST_STORM_CYCLES);
+    let mut disconnect_latencies = Vec::with_capacity(LOAD_TEST_STORM_CYCLES);
+    let mut overview_latencies =
+        Vec::with_capacity(LOAD_TEST_STORM_CYCLES * LOAD_TEST_STORM_READ_PROBES);
+    let mut nodes_latencies =
+        Vec::with_capacity(LOAD_TEST_STORM_CYCLES * LOAD_TEST_STORM_READ_PROBES);
+
+    for cycle in 0..LOAD_TEST_STORM_CYCLES {
+        let (ready_tx, mut ready_rx) = mpsc::unbounded_channel::<String>();
+        let burst_barrier = Arc::new(Barrier::new(node_count + 1));
+        let mut handles = Vec::with_capacity(node_count);
+        let workload = AgentWorkload {
+            uptime_start: cycle as u64 * 1_000 + 1,
+            metrics_per_node: LOAD_TEST_STORM_METRICS_PER_CYCLE,
+            inter_message_delay: Duration::from_millis(LOAD_TEST_STORM_METRIC_DELAY_MS),
+            hold_after_send: Duration::from_millis(250),
+        };
+        let expected_final_uptime = workload.uptime_start + workload.metrics_per_node - 1;
+        let connect_started = Instant::now();
+
+        for credential in credentials.clone() {
+            handles.push(tokio::spawn(run_fake_agent_session(
+                server.addr,
+                credential,
+                workload,
+                ready_tx.clone(),
+                burst_barrier.clone(),
+            )));
+        }
+        drop(ready_tx);
+
+        let mut ready_nodes = HashSet::with_capacity(node_count);
+        while ready_nodes.len() < node_count {
+            let next = timeout(Duration::from_secs(LOAD_TEST_TIMEOUT_SECS), ready_rx.recv())
+                .await
+                .with_context(|| format!("timed out waiting for storm cycle {} auth", cycle + 1))?;
+            let Some(node_id) = next else {
+                bail!(
+                    "storm cycle {} ready channel closed early after {} / {} nodes",
+                    cycle + 1,
+                    ready_nodes.len(),
+                    node_count
+                );
+            };
+            ready_nodes.insert(node_id);
+        }
+        connect_latencies.push(connect_started.elapsed());
+
+        let overview_task = tokio::spawn(probe_overview_latencies(
+            server.addr,
+            LOAD_TEST_STORM_READ_PROBES,
+        ));
+        let nodes_task = tokio::spawn(probe_nodes_latencies(
+            server.addr,
+            LOAD_TEST_STORM_READ_PROBES,
+            node_count,
+        ));
+
+        let recover_started = Instant::now();
+        burst_barrier.wait().await;
+        wait_for_final_snapshots(
+            server.shared.clone(),
+            &credentials,
+            expected_final_uptime,
+            Duration::from_secs(LOAD_TEST_TIMEOUT_SECS),
+            false,
+        )
+        .await?;
+        recover_latencies.push(recover_started.elapsed());
+
+        for handle in handles {
+            handle
+                .await
+                .map_err(|error| anyhow!("join storm agent task: {error}"))??;
+        }
+
+        let disconnect_started = Instant::now();
+        wait_for_all_offline(
+            server.shared.clone(),
+            &credentials,
+            Duration::from_secs(LOAD_TEST_TIMEOUT_SECS),
+        )
+        .await?;
+        disconnect_latencies.push(disconnect_started.elapsed());
+
+        overview_latencies.extend(
+            overview_task
+                .await
+                .map_err(|error| anyhow!("join storm overview probe task: {error}"))??,
+        );
+        nodes_latencies.extend(
+            nodes_task
+                .await
+                .map_err(|error| anyhow!("join storm nodes probe task: {error}"))??,
+        );
+    }
+
+    server.shutdown().await?;
+
+    Ok(StormScenarioResult {
+        nodes: node_count,
+        cycles: LOAD_TEST_STORM_CYCLES,
+        sessions_total: node_count * LOAD_TEST_STORM_CYCLES,
+        connect: summarize_latencies(&connect_latencies)?,
+        recover: summarize_latencies(&recover_latencies)?,
+        disconnect: summarize_latencies(&disconnect_latencies)?,
+        overview: summarize_latencies(&overview_latencies)?,
+        nodes_api: summarize_latencies(&nodes_latencies)?,
+    })
+}
+
 async fn run_fake_agent(
     addr: SocketAddr,
     credential: AgentCredential,
@@ -553,41 +738,31 @@ async fn run_fake_agent(
     burst_barrier: Arc<Barrier>,
     mut stop_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let url = format!("ws://{addr}/ws");
-    let (mut socket, _response) = connect_async(url)
-        .await
-        .with_context(|| format!("connect fake agent {}", credential.node_id))?;
-
-    let hello = WireMessage::Hello(HelloMessage {
-        token: credential.token.clone(),
-        identity: fake_identity(&credential),
-    });
-    send_wire_message(&mut socket, &hello).await?;
-    wait_for_authenticated_notice(&mut socket, &credential.node_id).await?;
-    ready_tx
-        .send(credential.node_id.clone())
-        .map_err(|_| anyhow!("ready channel closed"))?;
-
-    burst_barrier.wait().await;
-    for uptime_secs in 1..=workload.metrics_per_node {
-        let metrics = WireMessage::Metrics(MetricsMessage {
-            snapshot: fake_snapshot(uptime_secs),
-        });
-        send_wire_message(&mut socket, &metrics).await?;
-        if !workload.inter_message_delay.is_zero() {
-            sleep(workload.inter_message_delay).await;
-        }
-    }
+    let mut socket = connect_authenticated_fake_agent(addr, &credential, ready_tx).await?;
+    send_metrics_workload(&mut socket, workload, burst_barrier).await?;
 
     let _ = stop_rx.changed().await;
     let _ = socket.close(None).await;
     Ok(())
 }
 
-async fn wait_for_authenticated_notice(
-    socket: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
-    node_id: &str,
+async fn run_fake_agent_session(
+    addr: SocketAddr,
+    credential: AgentCredential,
+    workload: AgentWorkload,
+    ready_tx: mpsc::UnboundedSender<String>,
+    burst_barrier: Arc<Barrier>,
 ) -> Result<()> {
+    let mut socket = connect_authenticated_fake_agent(addr, &credential, ready_tx).await?;
+    send_metrics_workload(&mut socket, workload, burst_barrier).await?;
+    if !workload.hold_after_send.is_zero() {
+        sleep(workload.hold_after_send).await;
+    }
+    let _ = socket.close(None).await;
+    Ok(())
+}
+
+async fn wait_for_authenticated_notice(socket: &mut TestSocket, node_id: &str) -> Result<()> {
     timeout(Duration::from_secs(LOAD_TEST_TIMEOUT_SECS), async {
         loop {
             let Some(frame) = socket.next().await else {
@@ -635,10 +810,7 @@ async fn wait_for_authenticated_notice(
     .context("timed out waiting for authenticated notice")?
 }
 
-async fn send_wire_message(
-    socket: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
-    message: &WireMessage,
-) -> Result<()> {
+async fn send_wire_message(socket: &mut TestSocket, message: &WireMessage) -> Result<()> {
     let payload = serde_json::to_string(message).context("serialize wire message")?;
     socket
         .send(Message::Text(payload.into()))
@@ -705,6 +877,7 @@ async fn wait_for_final_snapshots(
     credentials: &[AgentCredential],
     expected_uptime: u64,
     timeout_duration: Duration,
+    require_online: bool,
 ) -> Result<()> {
     let started = Instant::now();
     let expected_nodes: HashSet<_> = credentials
@@ -720,7 +893,7 @@ async fn wait_for_final_snapshots(
             .collect();
         let all_ready = expected_nodes.iter().all(|node_id| {
             by_id.get(node_id).is_some_and(|status| {
-                status.online
+                (!require_online || status.online)
                     && status
                         .snapshot
                         .as_ref()
@@ -753,6 +926,86 @@ async fn wait_for_final_snapshots(
         }
         sleep(Duration::from_millis(20)).await;
     }
+}
+
+async fn wait_for_all_offline(
+    shared: SharedState,
+    credentials: &[AgentCredential],
+    timeout_duration: Duration,
+) -> Result<()> {
+    let started = Instant::now();
+    let expected_nodes: HashSet<_> = credentials
+        .iter()
+        .map(|item| item.node_id.as_str())
+        .collect();
+
+    loop {
+        let statuses = shared.list_statuses().await;
+        let by_id: HashMap<_, _> = statuses
+            .iter()
+            .map(|status| (status.identity.node_id.as_str(), status))
+            .collect();
+        let all_offline = expected_nodes
+            .iter()
+            .all(|node_id| by_id.get(node_id).is_some_and(|status| !status.online));
+        if all_offline {
+            return Ok(());
+        }
+        if started.elapsed() > timeout_duration {
+            let mut unfinished = Vec::new();
+            for node_id in &expected_nodes {
+                match by_id.get(node_id) {
+                    Some(status) => unfinished.push(format!("{node_id} online={}", status.online)),
+                    None => unfinished.push(format!("{node_id} missing")),
+                }
+            }
+            bail!(
+                "timed out waiting for all nodes to disconnect: {}",
+                unfinished.join(", ")
+            );
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn connect_authenticated_fake_agent(
+    addr: SocketAddr,
+    credential: &AgentCredential,
+    ready_tx: mpsc::UnboundedSender<String>,
+) -> Result<TestSocket> {
+    let url = format!("ws://{addr}/ws");
+    let (mut socket, _response) = connect_async(url)
+        .await
+        .with_context(|| format!("connect fake agent {}", credential.node_id))?;
+
+    let hello = WireMessage::Hello(HelloMessage {
+        token: credential.token.clone(),
+        identity: fake_identity(credential),
+    });
+    send_wire_message(&mut socket, &hello).await?;
+    wait_for_authenticated_notice(&mut socket, &credential.node_id).await?;
+    ready_tx
+        .send(credential.node_id.clone())
+        .map_err(|_| anyhow!("ready channel closed"))?;
+    Ok(socket)
+}
+
+async fn send_metrics_workload(
+    socket: &mut TestSocket,
+    workload: AgentWorkload,
+    burst_barrier: Arc<Barrier>,
+) -> Result<()> {
+    burst_barrier.wait().await;
+    for step in 0..workload.metrics_per_node {
+        let metrics = WireMessage::Metrics(MetricsMessage {
+            snapshot: fake_snapshot(workload.uptime_start + step),
+        });
+        send_wire_message(socket, &metrics).await?;
+        if !workload.inter_message_delay.is_zero() {
+            sleep(workload.inter_message_delay).await;
+        }
+    }
+    Ok(())
 }
 
 async fn seed_history_points(
