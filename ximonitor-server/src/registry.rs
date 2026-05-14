@@ -179,6 +179,21 @@ impl NodeRegistry {
         state.entries.len()
     }
 
+    /// 返回注册表中的节点条目,但不会暴露 token 字符串。
+    ///
+    /// 设置页需要查看 token 到期时间与登记标签;这些信息来自注册表而不是
+    /// 运行态快照。调用方负责只序列化安全字段,不要把 `token` 下发给浏览器。
+    pub async fn list_registered_nodes(&self) -> Vec<RegisteredNode> {
+        let state = self.state.read().await;
+        let mut nodes: Vec<_> = state.entries.values().cloned().collect();
+        nodes.sort_by(|left, right| {
+            left.node_label
+                .cmp(&right.node_label)
+                .then_with(|| left.node_id.cmp(&right.node_id))
+        });
+        nodes
+    }
+
     /// 一次性消费安装令牌:成功时返回对应的 `RegisteredNode`,并把令牌从注册表移除。
     pub async fn consume_install_token(&self, token: &str) -> Result<Option<RegisteredNode>> {
         validate_non_empty("install token", token)?;
