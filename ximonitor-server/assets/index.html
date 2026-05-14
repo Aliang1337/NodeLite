@@ -603,6 +603,39 @@
       .settings-message { min-height: 18px; color: var(--text-muted); font-size: 12px; }
       .settings-message.error { color: var(--accent-red); }
       .settings-message.ok { color: var(--accent-green); }
+      .totp-setup {
+        margin-top: 14px;
+        display: grid;
+        gap: 12px;
+        border: 1px solid var(--border-soft);
+        background: var(--bg-card-soft);
+        border-radius: 16px;
+        padding: 14px;
+      }
+      .totp-setup-grid {
+        display: grid;
+        grid-template-columns: 168px minmax(0, 1fr);
+        gap: 14px;
+        align-items: start;
+      }
+      .totp-qr-wrap {
+        border-radius: 16px;
+        background: #fff;
+        padding: 10px;
+        box-shadow: var(--shadow-soft);
+      }
+      .totp-qr { width: 100%; height: auto; display: block; }
+      .secret-box {
+        border: 1px solid var(--border-soft);
+        border-radius: 12px;
+        padding: 10px 12px;
+        color: var(--text-primary);
+        background: var(--bg-card);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 12px;
+        overflow-wrap: anywhere;
+        user-select: all;
+      }
       .token-table { width: 100%; border-collapse: collapse; font-size: 13px; }
       .token-table th { text-align: left; color: var(--text-muted); font-weight: 500; border-bottom: 1px solid var(--border-soft); padding: 9px 8px; }
       .token-table td { color: var(--text-secondary); border-bottom: 1px solid var(--border-soft); padding: 10px 8px; vertical-align: top; }
@@ -645,6 +678,7 @@
         .main { padding: 16px; }
         .page-header { flex-direction: column; align-items: stretch; }
         .settings-grid { grid-template-columns: minmax(0, 1fr); }
+        .totp-setup-grid { grid-template-columns: minmax(0, 1fr); }
       }
     </style>
   </head>
@@ -828,6 +862,7 @@
       let refreshTimer = null;
       let activeTab = "overview";
       let latestSettings = null;
+      let pendingTwoFactorSetup = null;
       const sparkHistory = new Map();
 
       // 国家区域 -> 大致(经度归一,纬度归一)中心。用于把节点 hint 到地图上。
@@ -1480,6 +1515,7 @@
               ${kv(t("settings.security.session_ttl"), fmtDurationSeconds(auth.session_ttl_secs))}
             </div>
             <p class="settings-note">${escapeHtml(t("settings.security.2fa_note"))}</p>
+            ${twoFactorControls(auth)}
             <div class="settings-actions">
               <button type="button" class="settings-button danger" id="settings-logout">${escapeHtml(t("settings.security.logout"))}</button>
             </div>
@@ -1524,6 +1560,47 @@
         return `<div><span>${escapeHtml(label)}</span><span>${escapeHtml(value ?? t("common.not_available"))}</span></div>`;
       }
 
+      function twoFactorControls(auth) {
+        if (auth.two_factor_enabled) {
+          return `<form class="settings-form totp-setup" id="totp-disable-form">
+            <p class="settings-note">${escapeHtml(t("settings.security.disable_note"))}</p>
+            <label>${escapeHtml(t("settings.password.current"))}<input class="settings-input" type="password" name="current_password" autocomplete="current-password" required></label>
+            <label>${escapeHtml(t("settings.security.verification_code"))}<input class="settings-input" type="text" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required></label>
+            <div class="settings-actions">
+              <button type="submit" class="settings-button danger">${escapeHtml(t("settings.security.disable_2fa"))}</button>
+            </div>
+            <div id="totp-message" class="settings-message"></div>
+          </form>`;
+        }
+        if (!pendingTwoFactorSetup) {
+          return `<div class="settings-actions">
+            <button type="button" class="settings-button primary" id="totp-start">${escapeHtml(t("settings.security.start_2fa"))}</button>
+          </div>
+          <div id="totp-message" class="settings-message"></div>`;
+        }
+        return `<div class="totp-setup" id="totp-setup-panel">
+          <div class="totp-setup-grid">
+            <div>
+              <div class="totp-qr-wrap">${pendingTwoFactorSetup.qr_svg}</div>
+            </div>
+            <div>
+              <h3>${escapeHtml(t("settings.security.scan_qr"))}</h3>
+              <p class="settings-note">${escapeHtml(t("settings.security.setup_note"))}</p>
+              <div class="secret-box">${escapeHtml(pendingTwoFactorSetup.secret)}</div>
+            </div>
+          </div>
+          <form class="settings-form" id="totp-enable-form">
+            <label>${escapeHtml(t("settings.password.current"))}<input class="settings-input" type="password" name="current_password" autocomplete="current-password" required></label>
+            <label>${escapeHtml(t("settings.security.verification_code"))}<input class="settings-input" type="text" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required></label>
+            <div class="settings-actions">
+              <button type="submit" class="settings-button primary">${escapeHtml(t("settings.security.enable_2fa"))}</button>
+              <button type="button" class="settings-button" id="totp-cancel">${escapeHtml(t("settings.security.cancel_setup"))}</button>
+            </div>
+            <div id="totp-message" class="settings-message"></div>
+          </form>
+        </div>`;
+      }
+
       function tokenTable(agents) {
         if (!agents.length) return `<div class="empty">${escapeHtml(t("settings.tokens.empty"))}</div>`;
         const rows = agents.map((agent) => {
@@ -1557,6 +1634,13 @@
           window.location.href = "/logout-and-reauth";
         });
         document.getElementById("settings-check-update")?.addEventListener("click", () => checkForUpdates(settings));
+        document.getElementById("totp-start")?.addEventListener("click", startTwoFactorSetup);
+        document.getElementById("totp-cancel")?.addEventListener("click", () => {
+          pendingTwoFactorSetup = null;
+          renderSettings(settings);
+        });
+        document.getElementById("totp-enable-form")?.addEventListener("submit", submitTwoFactorEnable);
+        document.getElementById("totp-disable-form")?.addEventListener("submit", submitTwoFactorDisable);
         document.getElementById("password-generate")?.addEventListener("click", () => {
           const input = document.querySelector("#password-form [name=new_password]");
           if (input) input.value = generatePassword();
@@ -1581,6 +1665,73 @@
         } catch (error) {
           message.className = "settings-message error";
           message.textContent = t("settings.version.check_failed", { error: error.message });
+        }
+      }
+
+      async function postSettingsJson(url, payload) {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/json" },
+          body: JSON.stringify(payload || {}),
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.message || `${response.status}`);
+        return body;
+      }
+
+      async function startTwoFactorSetup() {
+        const message = document.getElementById("totp-message");
+        message.className = "settings-message";
+        message.textContent = t("settings.security.starting_2fa");
+        try {
+          pendingTwoFactorSetup = await postSettingsJson("/api/settings/2fa/start", {});
+          renderSettings(latestSettings);
+        } catch (error) {
+          message.className = "settings-message error";
+          message.textContent = t("settings.security.action_failed", { error: error.message });
+        }
+      }
+
+      async function submitTwoFactorEnable(event) {
+        event.preventDefault();
+        const form = event.currentTarget;
+        const message = document.getElementById("totp-message");
+        message.className = "settings-message";
+        message.textContent = t("settings.security.enabling_2fa");
+        try {
+          await postSettingsJson("/api/settings/2fa/enable", {
+            current_password: form.current_password.value,
+            secret: pendingTwoFactorSetup?.secret || "",
+            code: form.code.value,
+          });
+          message.className = "settings-message ok";
+          message.textContent = t("settings.security.enabled_saved");
+          try { window.localStorage.removeItem("ximonitor.auth.timestamp"); } catch (_e) {}
+          window.setTimeout(() => { window.location.href = "/logout-and-reauth"; }, 900);
+        } catch (error) {
+          message.className = "settings-message error";
+          message.textContent = t("settings.security.action_failed", { error: error.message });
+        }
+      }
+
+      async function submitTwoFactorDisable(event) {
+        event.preventDefault();
+        const form = event.currentTarget;
+        const message = document.getElementById("totp-message");
+        message.className = "settings-message";
+        message.textContent = t("settings.security.disabling_2fa");
+        try {
+          await postSettingsJson("/api/settings/2fa/disable", {
+            current_password: form.current_password.value,
+            code: form.code.value,
+          });
+          message.className = "settings-message ok";
+          message.textContent = t("settings.security.disabled_saved");
+          try { window.localStorage.removeItem("ximonitor.auth.timestamp"); } catch (_e) {}
+          window.setTimeout(() => { window.location.href = "/logout-and-reauth"; }, 900);
+        } catch (error) {
+          message.className = "settings-message error";
+          message.textContent = t("settings.security.action_failed", { error: error.message });
         }
       }
 
@@ -1611,13 +1762,7 @@
         message.className = "settings-message";
         message.textContent = t("settings.password.saving");
         try {
-          const response = await fetch("/api/settings/password", {
-            method: "POST",
-            headers: { "content-type": "application/json", accept: "application/json" },
-            body: JSON.stringify(payload),
-          });
-          const body = await response.json().catch(() => ({}));
-          if (!response.ok) throw new Error(body.message || `${response.status}`);
+          await postSettingsJson("/api/settings/password", payload);
           message.className = "settings-message ok";
           message.textContent = t("settings.password.saved");
           try { window.localStorage.removeItem("ximonitor.auth.timestamp"); } catch (_e) {}
