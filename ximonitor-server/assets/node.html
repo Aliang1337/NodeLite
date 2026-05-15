@@ -1110,7 +1110,7 @@
       let overviewHistory = [];
       let latestHistory = [];
       let latestSettings = null;
-      let latestNodeTokenRotation = null;
+      let latestNodeTokenRefresh = null;
       let nodeSettingsNotice = null;
       let refreshTimer = null;
       let activeBrushDrag = null;
@@ -1521,6 +1521,7 @@
         const settingsNode = currentNodeSettingsEntry();
         const node = latestNode;
         const status = node ? statusLabel(nodeStatusKey(node)) : (settingsNode?.online ? t("common.online") : t("common.offline"));
+        const canRefreshOnline = Boolean(settingsNode?.online);
         const agentVersion = node?.identity?.agent_version || settingsNode?.agent_version || t("common.not_available");
         const remoteIp = node?.remote_ip || settingsNode?.remote_ip || t("common.not_available");
         const tags = Array.isArray(settingsNode?.tags) && settingsNode.tags.length
@@ -1532,8 +1533,8 @@
           ? fmtDateTime(settingsNode.token_expires_at)
           : t("settings.token.no_expiry");
         const tokenRemaining = fmtDurationSeconds(settingsNode?.token_expires_in_secs);
-        const upgradeCommand = latestNodeTokenRotation?.agent_upgrade_command || latestSettings?.updates?.agent_upgrade_command || t("common.not_available");
-        const rotation = latestNodeTokenRotation;
+        const upgradeCommand = latestSettings?.updates?.agent_upgrade_command || t("common.not_available");
+        const refresh = latestNodeTokenRefresh;
 
         if (!settingsNode) {
           root.innerHTML = `
@@ -1569,36 +1570,34 @@
           </article>
 
           <article class="settings-card full">
-            <h3>${escapeHtml(t("node.settings.rotate.title"))}</h3>
-            <p class="settings-note">${escapeHtml(t(auth.two_factor_enabled ? "node.settings.rotate.note_2fa" : "node.settings.rotate.note_password"))}</p>
-            <p class="settings-note">${escapeHtml(t("node.settings.rotate.disruptive_note"))}</p>
+            <h3>${escapeHtml(t("node.settings.refresh.title"))}</h3>
+            <p class="settings-note">${escapeHtml(t(auth.two_factor_enabled ? "node.settings.refresh.note_2fa" : "node.settings.refresh.note_password"))}</p>
+            ${canRefreshOnline ? "" : `<p class="settings-note">${escapeHtml(t("node.settings.refresh.offline"))}</p>`}
             ${auth.enabled ? `
-              <form class="settings-form" id="node-token-rotate-form">
+              <form class="settings-form" id="node-token-refresh-form">
                 ${nodeRotateConfirmationField(auth)}
                 <div class="settings-actions">
-                  <button type="submit" class="settings-button danger">${escapeHtml(t("node.settings.rotate.submit"))}</button>
+                  <button type="submit" class="settings-button" ${canRefreshOnline ? "" : "disabled"}>${escapeHtml(t("node.settings.refresh.submit"))}</button>
                 </div>
               </form>
-            ` : `<div class="settings-note">${escapeHtml(t("node.settings.rotate.unavailable"))}</div>`}
+            ` : `<div class="settings-note">${escapeHtml(t("node.settings.refresh.unavailable"))}</div>`}
             ${nodeSettingsNoticeHtml()}
           </article>
 
-          ${rotation ? `
+          ${refresh ? `
             <article class="settings-card full">
-              <h3>${escapeHtml(t("node.settings.rotate.install_title"))}</h3>
+              <h3>${escapeHtml(t("node.settings.refresh.result_title"))}</h3>
               <div class="settings-callout ok">
                 <div class="settings-kv">
-                  ${settingsKv(t("settings.tokens.expires_at"), rotation.token_expires_at ? fmtDateTime(rotation.token_expires_at) : t("settings.token.no_expiry"))}
-                  ${settingsKv(t("settings.tokens.remaining"), fmtDurationSeconds(rotation.token_expires_in_secs))}
-                  ${settingsKv(t("node.settings.rotate.install_expires"), fmtDateTime(rotation.install_token_expires_at))}
+                  ${settingsKv(t("settings.tokens.expires_at"), refresh.token_expires_at ? fmtDateTime(refresh.token_expires_at) : t("settings.token.no_expiry"))}
+                  ${settingsKv(t("settings.tokens.remaining"), fmtDurationSeconds(refresh.token_expires_in_secs))}
                 </div>
-                <p class="settings-note">${escapeHtml(t("node.settings.rotate.install_note"))}</p>
-                <pre class="settings-code">${escapeHtml(rotation.install_command)}</pre>
+                <p class="settings-note">${escapeHtml(t("node.settings.refresh.result_note"))}</p>
               </div>
             </article>
           ` : ""}
         `;
-        document.getElementById("node-token-rotate-form")?.addEventListener("submit", submitNodeTokenRotation);
+        document.getElementById("node-token-refresh-form")?.addEventListener("submit", submitNodeTokenRefresh);
       }
       async function refreshNodeSettings() {
         const root = document.getElementById("node-settings-root");
@@ -1615,25 +1614,25 @@
           }
         }
       }
-      async function submitNodeTokenRotation(event) {
+      async function submitNodeTokenRefresh(event) {
         event.preventDefault();
         const form = event.currentTarget;
         const auth = latestSettings?.auth || {};
         const payload = auth.two_factor_enabled
           ? { code: form.code.value }
           : { current_password: form.current_password.value };
-        nodeSettingsNotice = { kind: "", text: t("node.settings.rotate.submitting") };
+        nodeSettingsNotice = { kind: "", text: t("node.settings.refresh.submitting") };
         renderNodeSettings();
         try {
-          latestNodeTokenRotation = await postSettingsJson(`/api/nodes/${encodeURIComponent(NODE_ID)}/rotate-token`, payload);
-          nodeSettingsNotice = { kind: "ok", text: latestNodeTokenRotation.message || t("node.settings.rotate.success") };
+          latestNodeTokenRefresh = await postSettingsJson(`/api/nodes/${encodeURIComponent(NODE_ID)}/refresh-token`, payload);
+          nodeSettingsNotice = { kind: "ok", text: latestNodeTokenRefresh.message || t("node.settings.refresh.success") };
           try {
             latestSettings = await fetchJson("/api/settings");
           } catch (reloadError) {
-            console.warn("failed to reload settings after token rotation", reloadError);
+            console.warn("failed to reload settings after token refresh", reloadError);
           }
         } catch (error) {
-          nodeSettingsNotice = { kind: "error", text: t("node.settings.rotate.failed", { error: error.message }) };
+          nodeSettingsNotice = { kind: "error", text: t("node.settings.refresh.failed", { error: error.message }) };
         }
         renderNodeSettings();
       }
