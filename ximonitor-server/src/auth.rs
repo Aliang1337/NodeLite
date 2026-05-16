@@ -37,9 +37,8 @@ pub const TWO_FACTOR_AUTH_SECS: u64 = 24 * 60 * 60;
 /// 的代价压到不可接受的水平。
 pub const TWO_FACTOR_MAX_FAILED_ATTEMPTS: u32 = 5;
 /// 成功消费过的 TOTP `time_step` 在 store 中保留的时长。RFC 6238 §5.2
-/// 要求拒绝同一 step 的重复使用;我们用 90 秒(覆盖 ±1 漂移窗口的极限,
-/// 即"上一步刚被使用 → 时钟回退后仍可能落在合法窗口")完整保护一次步进。
-pub const TWO_FACTOR_TOTP_REPLAY_RETENTION_SECS: u64 = 90;
+/// 要求拒绝同一 step 的重复使用;150 秒覆盖 ±1 漂移窗口,并给调度延迟留出余量。
+pub const TWO_FACTOR_TOTP_REPLAY_RETENTION_SECS: u64 = 150;
 pub const TWO_FACTOR_PENDING_COOKIE: &str = "ximonitor_2fa_pending";
 pub const TWO_FACTOR_AUTH_COOKIE: &str = "ximonitor_auth";
 
