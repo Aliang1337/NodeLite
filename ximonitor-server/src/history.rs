@@ -425,7 +425,6 @@ fn open_database_connection(db_path: &PathBuf, enable_wal: bool) -> Result<Conne
             .pragma_update(None, "journal_mode", "WAL")
             .context("failed to enable sqlite WAL mode")?;
     }
-    harden_database_artifacts(db_path)?;
     Ok(connection)
 }
 
