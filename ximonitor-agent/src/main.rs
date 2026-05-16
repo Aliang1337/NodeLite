@@ -29,8 +29,8 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::{info, warn};
 use ximonitor_proto::{
     AgentConfig, AgentLogEntry, AgentLogsMessage, HelloMessage, MetricsMessage, NoticeLevel,
-    PingMessage, PongMessage, ServerNoticeMessage, WireMessage, parse_agent_config,
-    uses_insecure_remote_url,
+    PingMessage, PongMessage, ServerNoticeMessage, WIRE_PROTOCOL_VERSION, WireMessage,
+    parse_agent_config, uses_insecure_remote_url,
 };
 
 use crate::collector::new_collector;
@@ -348,6 +348,7 @@ async fn run_session(
     send_wire_message(
         &mut sender,
         &WireMessage::Hello(HelloMessage {
+            protocol_version: WIRE_PROTOCOL_VERSION,
             token: config.token.clone(),
             identity: identity.clone(),
         }),

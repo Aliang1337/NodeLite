@@ -19,7 +19,7 @@ pub use config::{
 pub use message::{
     AgentLogEntry, AgentLogsMessage, HelloMessage, MetricsMessage, NoticeLevel, PingMessage,
     PongMessage, RefreshTokenRequestMessage, RefreshTokenResponseMessage, ServerNoticeMessage,
-    WireMessage,
+    WIRE_PROTOCOL_VERSION, WireMessage,
 };
 pub use model::{
     DiskUsage, HistoryPoint, LoadAverage, MemoryUsage, NetworkCounters, NodeIdentity, NodeSnapshot,

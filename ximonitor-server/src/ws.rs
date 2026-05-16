@@ -25,7 +25,8 @@ use tokio::sync::mpsc;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{error, info, warn};
 use ximonitor_proto::{
-    AgentLogsMessage, HelloMessage, MetricsMessage, PongMessage, ServerNoticeMessage, WireMessage,
+    AgentLogsMessage, HelloMessage, MetricsMessage, PongMessage, ServerNoticeMessage,
+    WIRE_PROTOCOL_VERSION, WireMessage,
 };
 
 use crate::AppState;
@@ -126,6 +127,21 @@ async fn handle_socket(
             ));
         }
     };
+    if hello.protocol_version != WIRE_PROTOCOL_VERSION {
+        state.ws_admission.record_auth_failure(client_ip);
+        let notice = WireMessage::ServerNotice(ServerNoticeMessage {
+            level: ximonitor_proto::NoticeLevel::Error,
+            message: format!(
+                "unsupported protocol version {}; server expects {}",
+                hello.protocol_version, WIRE_PROTOCOL_VERSION
+            ),
+        });
+        let _ = send_wire_message(&mut socket, &notice).await;
+        return Err(ProtocolError::Client(format!(
+            "unsupported protocol version {}; expected {}",
+            hello.protocol_version, WIRE_PROTOCOL_VERSION
+        )));
+    }
     let mut session_token = hello.token.clone();
     let identity = match state
         .registry

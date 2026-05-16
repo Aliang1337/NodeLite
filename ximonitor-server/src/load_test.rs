@@ -984,6 +984,7 @@ async fn connect_authenticated_fake_agent(
         .with_context(|| format!("connect fake agent {}", credential.node_id))?;
 
     let hello = WireMessage::Hello(HelloMessage {
+        protocol_version: ximonitor_proto::WIRE_PROTOCOL_VERSION,
         token: credential.token.clone(),
         identity: fake_identity(credential),
     });

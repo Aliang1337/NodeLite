@@ -5,6 +5,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{NodeIdentity, NodeSnapshot};
 
+/// 当前 WebSocket 线协议版本。
+///
+/// 只要 `WireMessage` 的兼容性承诺被打破(删除字段、修改语义、移除变体),
+/// 就必须递增该版本,让 server 在握手阶段拒绝不兼容 agent。
+pub const WIRE_PROTOCOL_VERSION: u16 = 1;
+
+fn current_protocol_version() -> u16 {
+    WIRE_PROTOCOL_VERSION
+}
+
 /// 线协议消息枚举:WebSocket 通道上允许出现的所有消息类型。
 ///
 /// 序列化时通过 `type` 字段区分子类型,例如 `{"type":"hello", ...}`。
@@ -34,6 +44,8 @@ pub enum WireMessage {
 /// `token` 由 Server 的节点注册表分发,`identity` 由 Agent 在本地采集后填充。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HelloMessage {
+    #[serde(default = "current_protocol_version")]
+    pub protocol_version: u16,
     pub token: String,
     pub identity: NodeIdentity,
 }
@@ -110,9 +122,30 @@ mod tests {
 
     use super::{
         AgentLogEntry, AgentLogsMessage, HelloMessage, NoticeLevel, ServerNoticeMessage,
-        WireMessage,
+        WIRE_PROTOCOL_VERSION, WireMessage,
     };
     use crate::model::{LoadAverage, MemoryUsage, NetworkCounters, NodeIdentity, NodeSnapshot};
+
+    #[test]
+    fn hello_without_protocol_version_defaults_to_current_version() {
+        let payload = r#"{
+            "token":"node-token",
+            "identity":{
+                "node_id":"node-1",
+                "node_label":"Node 1",
+                "hostname":"node-1",
+                "os":"Linux",
+                "kernel_version":"6.8",
+                "cpu_model":"test cpu",
+                "cpu_cores":2,
+                "agent_version":"test",
+                "tags":[]
+            }
+        }"#;
+
+        let hello: HelloMessage = serde_json::from_str(payload).expect("valid legacy hello");
+        assert_eq!(hello.protocol_version, WIRE_PROTOCOL_VERSION);
+    }
 
     /// 验证所有 WireMessage 子类型都能完整序列化和反序列化。
     #[test]
@@ -130,6 +163,7 @@ mod tests {
             tags: vec!["apac".to_string()],
         };
         let hello = WireMessage::Hello(HelloMessage {
+            protocol_version: WIRE_PROTOCOL_VERSION,
             token: "token".to_string(),
             identity: identity.clone(),
         });
