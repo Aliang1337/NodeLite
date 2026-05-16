@@ -320,10 +320,10 @@ impl TestServer {
     {
         let started = std::time::Instant::now();
         loop {
-            if let Some(status) = self.shared.get_status(node_id).await {
-                if predicate(&status) {
-                    return Ok(status);
-                }
+            if let Some(status) = self.shared.get_status(node_id).await
+                && predicate(&status)
+            {
+                return Ok(status);
             }
             if started.elapsed() > timeout_duration {
                 bail!("timed out waiting for node status for {node_id}");
