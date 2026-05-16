@@ -1023,8 +1023,13 @@ fn settings_json_error(status: StatusCode, message: impl Into<String>) -> Respon
 }
 
 fn validate_password_for_settings(password: &str) -> Result<(), &'static str> {
+    const MAX_PASSWORD_CHARS: usize = 128;
+
     if password.len() < 8 {
         return Err("new password must be at least 8 characters");
+    }
+    if password.chars().count() > MAX_PASSWORD_CHARS {
+        return Err("new password must be at most 128 characters");
     }
     if !password.chars().any(|c| c.is_alphabetic()) || !password.chars().any(|c| c.is_ascii_digit())
     {
@@ -1526,7 +1531,7 @@ fn bearer_token_from_request(request: &Request) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{otpauth_uri, replace_auth_2fa};
+    use super::{otpauth_uri, replace_auth_2fa, validate_password_for_settings};
 
     #[test]
     fn replace_auth_2fa_enables_and_preserves_auth_section() {
@@ -1575,6 +1580,15 @@ totp_secret = "JBSWY3DPEHPK3PXP"
         assert_eq!(
             uri,
             "otpauth://totp/XiMonitor:viewer%40example.com?secret=JBSWY3DPEHPK3PXP&issuer=XiMonitor"
+        );
+    }
+
+    #[test]
+    fn validate_password_for_settings_rejects_overlong_passwords() {
+        let password = format!("Aa1{}", "x".repeat(130));
+        assert_eq!(
+            validate_password_for_settings(&password),
+            Err("new password must be at most 128 characters")
         );
     }
 }
