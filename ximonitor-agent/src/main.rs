@@ -25,10 +25,9 @@ use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::{info, warn};
-use url::Url;
 use ximonitor_proto::{
     AgentConfig, HelloMessage, MetricsMessage, NoticeLevel, PingMessage, PongMessage,
-    ServerNoticeMessage, WireMessage, parse_agent_config,
+    ServerNoticeMessage, WireMessage, parse_agent_config, uses_insecure_remote_url,
 };
 
 use crate::collector::new_collector;
@@ -488,28 +487,7 @@ fn spawn_insecure_transport_warning(server_url: String) {
 
 /// 判定服务器 URL 是否属于"远程明文"传输:`ws://` 且主机不是本地回环。
 fn uses_insecure_remote_transport(server_url: &str) -> bool {
-    let Ok(url) = Url::parse(server_url) else {
-        return false;
-    };
-    if url.scheme() != "ws" {
-        return false;
-    }
-
-    !host_is_local(url.host_str())
-}
-
-/// 判定主机字段是否表示本机:`localhost` 或回环 IP。
-fn host_is_local(host: Option<&str>) -> bool {
-    let Some(host) = host else {
-        return false;
-    };
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-
-    host.parse::<std::net::IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false)
+    uses_insecure_remote_url(server_url, "ws")
 }
 
 /// 更新配置文件中的 token。

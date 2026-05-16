@@ -7,6 +7,7 @@
 pub mod config;
 pub mod message;
 pub mod model;
+pub mod netutil;
 
 pub use config::{
     AgentConfig, ConfigError, DEFAULT_HISTORY_RETENTION_HOURS, DEFAULT_HISTORY_WRITE_INTERVAL_SECS,
@@ -23,3 +24,4 @@ pub use model::{
     DiskUsage, HistoryPoint, LoadAverage, MemoryUsage, NetworkCounters, NodeIdentity, NodeSnapshot,
     NodeStatus, OverviewData, percentage,
 };
+pub use netutil::{host_is_local, uses_insecure_remote_url};

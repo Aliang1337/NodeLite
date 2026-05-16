@@ -15,6 +15,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use url::{Url, form_urlencoded};
 
+use crate::netutil::uses_insecure_remote_url;
+
 /// 节点超时阈值:超过该时长未收到任何报文即视为离线。
 pub const DEFAULT_STALE_AFTER_SECS: u64 = 20;
 /// Server 默认 ping 间隔(秒)。
@@ -456,27 +458,7 @@ impl RawServerConfigFile {
 }
 
 fn uses_insecure_remote_public_base_url(public_base_url: &str) -> bool {
-    let Ok(url) = Url::parse(public_base_url) else {
-        return false;
-    };
-    if url.scheme() != "http" {
-        return false;
-    }
-
-    !host_is_local(url.host_str())
-}
-
-fn host_is_local(host: Option<&str>) -> bool {
-    let Some(host) = host else {
-        return false;
-    };
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-
-    host.parse::<std::net::IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false)
+    uses_insecure_remote_url(public_base_url, "http")
 }
 
 impl RawAgentConfigFile {

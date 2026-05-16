@@ -48,7 +48,7 @@ use tokio::time::{MissedTickBehavior, interval};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 use url::Url;
-use ximonitor_proto::{ServerConfig, parse_server_config};
+use ximonitor_proto::{ServerConfig, parse_server_config, uses_insecure_remote_url};
 
 use crate::admission::{InstallAdmissionConfig, InstallAdmissionController, WsAdmissionController};
 use crate::auth::{ReadonlyRouteAuth, TwoFactorSessions};
@@ -472,20 +472,7 @@ fn uses_insecure_remote_public_base_url(
         return true;
     }
 
-    !host_is_local(url.host_str())
-}
-
-fn host_is_local(host: Option<&str>) -> bool {
-    let Some(host) = host else {
-        return false;
-    };
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-
-    host.parse::<std::net::IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false)
+    uses_insecure_remote_url(public_base_url, "http")
 }
 
 /// 启动期尝试从磁盘恢复一份 NodeStatus 列表,失败时记录日志并继续以空状态启动。
