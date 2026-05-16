@@ -238,10 +238,14 @@ impl InstallAdmissionController {
 
 /// 解析客户端真实 IP。
 ///
-/// 当 Server 仅监听回环地址(典型的反向代理部署),允许从 `X-Forwarded-For` / `X-Real-IP` 中读取上游 IP;
-/// 否则直接使用 TCP 连接的对端地址,避免被恶意请求伪造来源。
-pub fn resolve_client_ip(listen: SocketAddr, peer_addr: SocketAddr, headers: &HeaderMap) -> IpAddr {
-    if !listen.ip().is_loopback() {
+/// 当 TCP 直连对端是本机反代时,允许读取 `X-Forwarded-For` / `X-Real-IP`;
+/// 其他直连请求一律使用 socket peer IP,避免公网客户端伪造代理头。
+pub fn resolve_client_ip(
+    _listen: SocketAddr,
+    peer_addr: SocketAddr,
+    headers: &HeaderMap,
+) -> IpAddr {
+    if !peer_addr.ip().is_loopback() {
         return peer_addr.ip();
     }
 

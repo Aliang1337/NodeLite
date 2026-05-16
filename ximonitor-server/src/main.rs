@@ -1399,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn loopback_listener_uses_forwarded_ip_for_ws_limits() {
+    fn loopback_proxy_peer_uses_forwarded_ip_for_ws_limits() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-forwarded-for",
@@ -1409,6 +1409,40 @@ mod tests {
         let client_ip = resolve_client_ip(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080)),
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 51234)),
+            &headers,
+        );
+
+        assert_eq!(client_ip, IpAddr::V4("198.51.100.24".parse().expect("ip")));
+    }
+
+    #[test]
+    fn public_listener_behind_local_proxy_uses_forwarded_ip() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.24".parse().expect("header value"),
+        );
+
+        let client_ip = resolve_client_ip(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8080)),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 51234)),
+            &headers,
+        );
+
+        assert_eq!(client_ip, IpAddr::V4("198.51.100.24".parse().expect("ip")));
+    }
+
+    #[test]
+    fn public_direct_peer_ignores_spoofed_forwarded_ip() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "8.8.8.8".parse().expect("header value"));
+
+        let client_ip = resolve_client_ip(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8080)),
+            SocketAddr::V4(SocketAddrV4::new(
+                "198.51.100.24".parse().expect("ip"),
+                51234,
+            )),
             &headers,
         );
 
