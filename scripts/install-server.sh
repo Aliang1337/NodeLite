@@ -149,20 +149,20 @@ random_hex() {
 # 生成符合密码策略的强密码（至少12字符，包含大小写字母、数字、特殊字符）
 generate_strong_password() {
   # 定义字符集
-  local uppercase="ABCDEFGHJKLMNPQRSTUVWXYZ"  # 去除易混淆的 I O
-  local lowercase="abcdefghijkmnopqrstuvwxyz"  # 去除易混淆的 l
-  local digits="23456789"  # 去除易混淆的 0 1
-  local special="!@#$%^&*-_=+"
+  uppercase="ABCDEFGHJKLMNPQRSTUVWXYZ"  # 去除易混淆的 I O
+  lowercase="abcdefghijkmnopqrstuvwxyz"  # 去除易混淆的 l
+  digits="23456789"  # 去除易混淆的 0 1
+  special="!@#\$%^&*-_=+"
 
   # 确保至少包含每种字符类型
-  local password=""
+  password=""
   password="${password}$(echo "$uppercase" | fold -w1 | shuf -n2 | tr -d '\n')"
   password="${password}$(echo "$lowercase" | fold -w1 | shuf -n2 | tr -d '\n')"
   password="${password}$(echo "$digits" | fold -w1 | shuf -n2 | tr -d '\n')"
   password="${password}$(echo "$special" | fold -w1 | shuf -n2 | tr -d '\n')"
 
   # 添加更多随机字符达到16位
-  local all_chars="${uppercase}${lowercase}${digits}${special}"
+  all_chars="${uppercase}${lowercase}${digits}${special}"
   password="${password}$(echo "$all_chars" | fold -w1 | shuf -n8 | tr -d '\n')"
 
   # 打乱顺序
