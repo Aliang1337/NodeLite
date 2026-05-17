@@ -392,7 +392,10 @@ pub(crate) async fn refresh_node_token(
         Ok(reply) => Some(reply.token_expires_at),
         Err(message) => {
             error!(node_id = %node_id, error = %message, "manual online token refresh failed");
-            return settings_json_error(StatusCode::BAD_GATEWAY, &message);
+            return settings_json_error(
+                StatusCode::BAD_GATEWAY,
+                "failed to refresh token on the online agent",
+            );
         }
     };
     let now = Utc::now();
