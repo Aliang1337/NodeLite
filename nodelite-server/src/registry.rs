@@ -1100,8 +1100,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let temp_dir =
-            std::env::temp_dir().join(format!("nodelite-registry-expiry-test-{unique}"));
+        let temp_dir = std::env::temp_dir().join(format!("nodelite-registry-expiry-test-{unique}"));
         std::fs::create_dir_all(&temp_dir).expect("temp dir");
         let path = temp_dir.join("server.json");
 

@@ -202,10 +202,7 @@ impl SharedState {
         self.view_revision.fetch_add(1, Ordering::Relaxed);
     }
 
-    async fn cached_api_json_bytes(
-        &self,
-        kind: ApiBodyKind,
-    ) -> Result<Bytes, serde_json::Error> {
+    async fn cached_api_json_bytes(&self, kind: ApiBodyKind) -> Result<Bytes, serde_json::Error> {
         let revision = self.view_revision.load(Ordering::Relaxed);
         {
             let cache = self.api_cache.lock().await;
@@ -484,9 +481,8 @@ impl Registry {
         // 用 u128 累加并取平均值,避免在罕见情况下(极大延迟、海量节点)
         // 触发 u64 加法溢出 —— debug 构建会 panic,release 构建会回绕成
         // 异常小的"平均延迟",污染仪表盘。
-        let average_latency_ms = (latency_samples > 0).then(|| {
-            latency_total as f64 / latency_samples as f64
-        });
+        let average_latency_ms =
+            (latency_samples > 0).then(|| latency_total as f64 / latency_samples as f64);
 
         OverviewData {
             generated_at: Utc::now(),
@@ -537,7 +533,9 @@ mod tests {
     use std::time::Duration;
 
     use chrono::{Duration as ChronoDuration, TimeZone, Utc};
-    use nodelite_proto::{LoadAverage, MemoryUsage, NodeSnapshot, ReadonlyAuthConfig, ServerConfig, WsConfig};
+    use nodelite_proto::{
+        LoadAverage, MemoryUsage, NodeSnapshot, ReadonlyAuthConfig, ServerConfig, WsConfig,
+    };
     use nodelite_proto::{NetworkCounters, percentage};
     use tokio::sync::mpsc;
 
@@ -713,14 +711,19 @@ mod tests {
     #[tokio::test]
     async fn cached_api_json_invalidates_after_visible_status_change() {
         let shared = SharedState::new(Arc::new(sample_config()));
-        let session_id = shared.register_node(sample_identity(), Some("198.51.100.10".to_string())).await;
+        let session_id = shared
+            .register_node(sample_identity(), Some("198.51.100.10".to_string()))
+            .await;
 
         let first_nodes = shared.nodes_json_bytes().await.expect("nodes json");
         let first_overview = shared.overview_json_bytes().await.expect("overview json");
 
         shared.mark_disconnected("hk-01", session_id).await;
 
-        let second_nodes = shared.nodes_json_bytes().await.expect("nodes json after disconnect");
+        let second_nodes = shared
+            .nodes_json_bytes()
+            .await
+            .expect("nodes json after disconnect");
         let second_overview = shared
             .overview_json_bytes()
             .await

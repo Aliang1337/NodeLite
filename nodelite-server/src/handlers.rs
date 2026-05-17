@@ -543,11 +543,7 @@ pub(crate) async fn nodes(State(state): State<AppState>) -> Response {
             .into_response(),
         Err(error) => {
             error!(error = ?error, "failed to serialize nodes response");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to render nodes",
-            )
-                .into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, "failed to render nodes").into_response()
         }
     }
 }
