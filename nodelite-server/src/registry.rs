@@ -936,7 +936,7 @@ fn toml_escape(value: &str) -> String {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use chrono::{Duration as ChronoDuration, Utc};
+    use chrono::{Duration as ChronoDuration, TimeZone, Utc};
     use proptest::prelude::*;
     use tokio::runtime::Runtime;
 
@@ -1295,6 +1295,25 @@ mod tests {
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_dir(&temp_dir);
         });
+    }
+
+    #[test]
+    fn token_is_expired_at_exact_expiry_moment() {
+        let expires_at = Utc.with_ymd_and_hms(2026, 5, 18, 12, 0, 0).unwrap();
+        let entry = RegisteredNode {
+            node_id: "boundary-01".to_string(),
+            node_label: "Boundary 01".to_string(),
+            token: "secret".to_string(),
+            tags: Vec::new(),
+            created_at: expires_at - ChronoDuration::minutes(5),
+            token_expires_at: Some(expires_at),
+        };
+
+        assert!(!super::token_is_unexpired(&entry, expires_at));
+        assert!(super::token_is_unexpired(
+            &entry,
+            expires_at - ChronoDuration::nanoseconds(1),
+        ));
     }
 
     #[test]
