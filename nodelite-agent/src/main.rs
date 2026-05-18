@@ -159,7 +159,10 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    spawn_insecure_transport_warning(config.server.clone(), config.insecure_transport_warn_interval_secs);
+    spawn_insecure_transport_warning(
+        config.server.clone(),
+        config.insecure_transport_warn_interval_secs,
+    );
     run_forever(config, collector, identity, cli.config, log_buffer).await
 }
 
@@ -327,7 +330,11 @@ async fn run_session(
     );
     let (socket, _) = timeout(
         Duration::from_secs(config.connect_timeout_secs),
-        connect_async_with_config(config.server.as_str(), Some(incoming_ws_config(config.max_incoming_message_bytes)), false),
+        connect_async_with_config(
+            config.server.as_str(),
+            Some(incoming_ws_config(config.max_incoming_message_bytes)),
+            false,
+        ),
     )
     .await
     .map_err(|_| session_error(false, anyhow!("timed out connecting to {}", config.server)))?
@@ -598,7 +605,10 @@ fn sample_random_u64() -> Option<u64> {
 }
 
 /// 若 Agent 配置了未启用 TLS 的远程服务器,则周期性输出警告日志。
-fn spawn_insecure_transport_warning(server_url: String, insecure_transport_warn_interval_secs: u64) {
+fn spawn_insecure_transport_warning(
+    server_url: String,
+    insecure_transport_warn_interval_secs: u64,
+) {
     if !uses_insecure_remote_transport(&server_url) {
         return;
     }

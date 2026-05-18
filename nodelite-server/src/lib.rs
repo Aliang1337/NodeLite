@@ -52,7 +52,9 @@ use nodelite_proto::{ServerConfig, parse_server_config, uses_insecure_remote_url
 use tokio::fs;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
+use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 use url::Url;
@@ -91,6 +93,9 @@ pub(crate) struct AppState {
     pub(crate) readonly_auth: Arc<RwLock<ReadonlyRouteAuth>>,
     pub(crate) two_factor_sessions: TwoFactorSessions,
     pub(crate) config_path: Arc<PathBuf>,
+    /// 进程级关停信号。axum graceful shutdown 之后由 `run_server` 触发,
+    /// 所有后台任务与活跃 WS 会话都订阅此 token 以协同退出。
+    pub(crate) shutdown: CancellationToken,
 }
 
 /// 只跟踪"对外是否可服务"所需的几个关键依赖状态。
@@ -178,22 +183,40 @@ async fn run_server(config_path: &Path) -> Result<()> {
             )
         })?;
     let shared = SharedState::new(Arc::clone(&config));
-    let history = HistoryStore::new(config.history_db_path.clone(), config.sqlite_busy_timeout_secs);
+    let history = HistoryStore::new(
+        config.history_db_path.clone(),
+        config.sqlite_busy_timeout_secs,
+    );
     let agent_logs = AgentLogStore::new();
     history.initialize().await;
     let readiness = ServerReadiness::new(history.is_available());
     readiness.mark_history_available(history.is_available());
     restore_snapshot_if_available(&shared, config.snapshot_path.as_path()).await;
 
-    spawn_registry_reloader(
+    let shutdown = CancellationToken::new();
+    let mut background_tasks: Vec<JoinHandle<()>> = Vec::new();
+
+    background_tasks.push(spawn_registry_reloader(
         registry.clone(),
         history.clone(),
         agent_logs.clone(),
         readiness.clone(),
-    );
-    spawn_stale_reaper(shared.clone());
-    spawn_snapshot_persistor(shared.clone(), config.snapshot_path.clone());
-    spawn_insecure_transport_warning(config.public_base_url.clone(), config.listen, config.insecure_transport_warn_interval_secs);
+        shutdown.clone(),
+    ));
+    background_tasks.push(spawn_stale_reaper(shared.clone(), shutdown.clone()));
+    background_tasks.push(spawn_snapshot_persistor(
+        shared.clone(),
+        config.snapshot_path.clone(),
+        shutdown.clone(),
+    ));
+    if let Some(handle) = spawn_insecure_transport_warning(
+        config.public_base_url.clone(),
+        config.listen,
+        config.insecure_transport_warn_interval_secs,
+        shutdown.clone(),
+    ) {
+        background_tasks.push(handle);
+    }
 
     let enrolled_nodes = registry.count().await;
     info!(
@@ -226,8 +249,10 @@ async fn run_server(config_path: &Path) -> Result<()> {
         readonly_auth: Arc::new(RwLock::new(readonly_route_auth.clone())),
         two_factor_sessions: TwoFactorSessions::new(),
         config_path: Arc::new(config_path.to_path_buf()),
+        shutdown: shutdown.clone(),
     };
     let shared_for_shutdown = state.shared.clone();
+    let history_for_shutdown = state.history.clone();
     let snapshot_path = config.snapshot_path.clone();
     let protected_routes = Router::new()
         .route("/", get(index))
@@ -287,6 +312,30 @@ async fn run_server(config_path: &Path) -> Result<()> {
     .await
     .context("server exited unexpectedly")?;
 
+    // axum 的 graceful shutdown 只 drain HTTP 请求,不会通知 WebSocket 会话或
+    // 后台任务。这里在 HTTP 端 drain 完成后, cancel 全局 token, 让:
+    //   - 每个 spawn_* 后台任务从各自的 select! 跳出, 结束 loop;
+    //   - 每个活跃 WebSocket handle_socket 发出 Close 帧后退出。
+    info!("propagating shutdown signal to background tasks and websocket sessions");
+    shutdown.cancel();
+
+    // 给所有后台任务最多 5 秒收尾;超时则强制 abort 避免拖延 systemd 的 TimeoutStopSec。
+    let join_deadline = Duration::from_secs(5);
+    for handle in background_tasks {
+        match tokio::time::timeout(join_deadline, handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                warn!(error = ?error, "background task ended with error during shutdown");
+            }
+            Err(_) => {
+                warn!(
+                    timeout_secs = join_deadline.as_secs(),
+                    "background task did not exit in time during shutdown"
+                );
+            }
+        }
+    }
+
     // 周期持久化任务每 15 秒落盘一次,SIGTERM 期间最近一次 tick 之后的状态变更可能
     // 还没刷到磁盘。这里同步再落一次,确保 systemd restart 后看到的就是退出前最新视图。
     info!("flushing final snapshot before shutdown");
@@ -294,6 +343,12 @@ async fn run_server(config_path: &Path) -> Result<()> {
     if let Err(error) = persist_snapshot(snapshot_path.as_path(), &final_statuses).await {
         warn!(error = ?error, path = %snapshot_path.display(), "failed to flush final snapshot");
     }
+
+    // History writer 仍可能有入队但未 flush 的样本(WS 在收到 Close 之前
+    // 最后那一拍上报的数据)。显式 drain 一次,避免 systemd restart 后历史断档。
+    info!("draining history writer before shutdown");
+    history_for_shutdown.shutdown().await;
+
     info!("nodelite server shutdown complete");
     Ok(())
 }
@@ -397,20 +452,24 @@ async fn load_server_config(path: &Path) -> Result<ServerConfig> {
 }
 
 /// 后台任务:每秒扫描一次注册表,把超时节点标记为离线。
-fn spawn_stale_reaper(shared: SharedState) {
+fn spawn_stale_reaper(shared: SharedState, shutdown: CancellationToken) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(1));
         // 进程或主机被挂起后,interval 默认会"补打"积压 tick;这里改为延后下一次,
         // 避免恢复瞬间连续多次扫描全表(对大规模注册表是无谓的 CPU 抖动)。
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
-            let count = shared.mark_stale().await;
-            if count > 0 {
-                info!(count, "marked stale nodes offline");
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = ticker.tick() => {
+                    let count = shared.mark_stale().await;
+                    if count > 0 {
+                        info!(count, "marked stale nodes offline");
+                    }
+                }
             }
         }
-    });
+    })
 }
 
 /// 后台任务:每秒检查一次注册表文件是否有外部更改(例如 CLI 颁发了新节点)。
@@ -419,63 +478,77 @@ fn spawn_registry_reloader(
     history: HistoryStore,
     agent_logs: AgentLogStore,
     readiness: ServerReadiness,
-) {
+    shutdown: CancellationToken,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(1));
         // 挂起恢复后只想做一次最近态的 reload,而不是连续 N 次磁盘 IO。
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
-            match registry.reload().await {
-                Ok(true) => {
-                    readiness.mark_registry_reload_healthy(true);
-                    let enrolled_nodes = registry.count().await;
-                    let node_ids = registry.node_ids().await;
-                    let cleaned_history_nodes = history.forget_missing(&node_ids).await;
-                    let cleaned_agent_log_nodes = agent_logs.forget_missing(&node_ids).await;
-                    info!(
-                        registry_path = %registry.path().display(),
-                        enrolled_nodes,
-                        cleaned_history_nodes,
-                        cleaned_agent_log_nodes,
-                        "reloaded node registry",
-                    );
-                }
-                Ok(false) => {
-                    readiness.mark_registry_reload_healthy(true);
-                }
-                Err(error) => {
-                    readiness.mark_registry_reload_healthy(false);
-                    warn!(
-                        error = ?error,
-                        registry_path = %registry.path().display(),
-                        "failed to reload node registry; keeping previous in-memory snapshot",
-                    );
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = ticker.tick() => {
+                    match registry.reload().await {
+                        Ok(true) => {
+                            readiness.mark_registry_reload_healthy(true);
+                            let enrolled_nodes = registry.count().await;
+                            let node_ids = registry.node_ids().await;
+                            let cleaned_history_nodes = history.forget_missing(&node_ids).await;
+                            let cleaned_agent_log_nodes = agent_logs.forget_missing(&node_ids).await;
+                            info!(
+                                registry_path = %registry.path().display(),
+                                enrolled_nodes,
+                                cleaned_history_nodes,
+                                cleaned_agent_log_nodes,
+                                "reloaded node registry",
+                            );
+                        }
+                        Ok(false) => {
+                            readiness.mark_registry_reload_healthy(true);
+                        }
+                        Err(error) => {
+                            readiness.mark_registry_reload_healthy(false);
+                            warn!(
+                                error = ?error,
+                                registry_path = %registry.path().display(),
+                                "failed to reload node registry; keeping previous in-memory snapshot",
+                            );
+                        }
+                    }
                 }
             }
         }
-    });
+    })
 }
 
 /// 在监听非回环地址但仍然使用 `http://` 公网基址时,周期性输出 TLS 警告。
-fn spawn_insecure_transport_warning(public_base_url: String, listen: std::net::SocketAddr, insecure_transport_warn_interval_secs: u64) {
+fn spawn_insecure_transport_warning(
+    public_base_url: String,
+    listen: std::net::SocketAddr,
+    insecure_transport_warn_interval_secs: u64,
+    shutdown: CancellationToken,
+) -> Option<JoinHandle<()>> {
     if !uses_insecure_remote_public_base_url(&public_base_url, listen) {
-        return;
+        return None;
     }
 
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(insecure_transport_warn_interval_secs));
         // 警告是节流型日志,跳过错过的 tick 即可,不要在恢复后连续 burst 多条相同警告。
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
-            ticker.tick().await;
-            warn!(
-                listen = %listen,
-                public_base_url = %public_base_url,
-                "server is configured without TLS; use an https:// public_base_url and terminate TLS in front of NodeLite",
-            );
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = ticker.tick() => {
+                    warn!(
+                        listen = %listen,
+                        public_base_url = %public_base_url,
+                        "server is configured without TLS; use an https:// public_base_url and terminate TLS in front of NodeLite",
+                    );
+                }
+            }
         }
-    });
+    }))
 }
 
 fn uses_insecure_remote_public_base_url(
@@ -573,6 +646,7 @@ mod tests {
     use chrono::Utc;
     use tokio::runtime::Runtime;
     use tokio::sync::RwLock;
+    use tokio_util::sync::CancellationToken;
     use tower::util::ServiceExt;
 
     use super::{
@@ -671,6 +745,7 @@ mod tests {
             readonly_auth: Arc::new(RwLock::new(ReadonlyRouteAuth::from_config(None))),
             two_factor_sessions: TwoFactorSessions::new(),
             config_path: Arc::new(PathBuf::from("config/server.toml")),
+            shutdown: CancellationToken::new(),
         };
 
         let _app: Router = Router::new()
@@ -913,6 +988,7 @@ mod tests {
                 readonly_auth: Arc::new(RwLock::new(ReadonlyRouteAuth::from_config(None))),
                 two_factor_sessions: TwoFactorSessions::new(),
                 config_path: Arc::new(temp_dir.join("server.toml")),
+                shutdown: CancellationToken::new(),
             };
             let request = Request::builder()
                 .uri("/install/bootstrap")
@@ -1017,6 +1093,7 @@ mod tests {
                 readonly_auth: Arc::new(RwLock::new(ReadonlyRouteAuth::from_config(None))),
                 two_factor_sessions: TwoFactorSessions::new(),
                 config_path: Arc::new(temp_dir.join("server.toml")),
+                shutdown: CancellationToken::new(),
             };
             let app: Router = Router::new()
                 .route("/", get(index))

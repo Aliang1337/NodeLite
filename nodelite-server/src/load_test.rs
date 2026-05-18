@@ -170,7 +170,7 @@ impl TestServer {
             credentials.push(AgentCredential {
                 node_id,
                 node_label,
-                token: issued.node.token,
+                token: issued.node_session_token,
             });
         }
 
@@ -236,6 +236,7 @@ impl TestServer {
             ))),
             two_factor_sessions: TwoFactorSessions::new(),
             config_path: Arc::new(temp_dir.join("server.toml")),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
 
         let shared = state.shared.clone();

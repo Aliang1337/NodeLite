@@ -513,7 +513,9 @@ impl RawServerConfigFile {
             agent_release_sha256_aarch64,
             hello_timeout_secs: self.server.hello_timeout_secs,
             max_outstanding_pings: self.server.max_outstanding_pings,
-            insecure_transport_warn_interval_secs: self.server.insecure_transport_warn_interval_secs,
+            insecure_transport_warn_interval_secs: self
+                .server
+                .insecure_transport_warn_interval_secs,
             max_sanitized_disks: self.server.max_sanitized_disks,
             max_sanitized_string_bytes: self.server.max_sanitized_string_bytes,
             metric_anomaly_session_limit: self.server.metric_anomaly_session_limit,

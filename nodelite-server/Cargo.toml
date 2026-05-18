@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+argon2.workspace = true
 axum.workspace = true
 base32 = "0.5"
 base64.workspace = true
@@ -24,6 +25,7 @@ serde_json.workspace = true
 subtle.workspace = true
 time = "0.3"
 tokio.workspace = true
+tokio-util.workspace = true
 totp-lite = "2.0"
 tower-http.workspace = true
 tracing.workspace = true

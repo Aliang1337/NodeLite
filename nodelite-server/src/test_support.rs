@@ -14,7 +14,6 @@ use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
-use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::connect_async;
@@ -55,7 +54,7 @@ pub struct TestServer {
     registry: NodeRegistry,
     registry_path: PathBuf,
     shared: SharedState,
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    shutdown: tokio_util::sync::CancellationToken,
     server_handle: JoinHandle<Result<(), std::io::Error>>,
     temp_dir: PathBuf,
 }
@@ -147,8 +146,10 @@ impl TestServer {
             ))),
             two_factor_sessions: TwoFactorSessions::new(),
             config_path: Arc::new(temp_dir.join("server.toml")),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         let shared = state.shared.clone();
+        let shutdown = state.shutdown.clone();
         let protected_routes = Router::new()
             .route("/api/overview", get(overview))
             .route("/metrics", get(metrics))
@@ -163,14 +164,16 @@ impl TestServer {
             .with_state(state)
             .layer(TraceLayer::new_for_http());
 
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let shutdown_for_axum = shutdown.clone();
         let server_handle = tokio::spawn(async move {
             axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<SocketAddr>(),
             )
-            .with_graceful_shutdown(async {
-                let _ = shutdown_rx.await;
+            .with_graceful_shutdown(async move {
+                // 测试通过 cancel CancellationToken 触发 graceful shutdown:
+                // 这也是 production code 在 run_server 中走的同一条路径。
+                shutdown_for_axum.cancelled().await;
             })
             .await
         });
@@ -180,7 +183,7 @@ impl TestServer {
             registry,
             registry_path,
             shared,
-            shutdown_tx: Some(shutdown_tx),
+            shutdown,
             server_handle,
             temp_dir,
         })
@@ -203,7 +206,7 @@ impl TestServer {
         Ok(TestNode {
             node_id: issued.node.node_id,
             node_label: issued.node.node_label,
-            token: issued.node.token,
+            token: issued.node_session_token,
         })
     }
 
@@ -300,13 +303,28 @@ impl TestServer {
     }
 
     pub async fn is_token_current(&self, node_id: &str, token: &str) -> bool {
-        self.registry.is_token_current(node_id, token).await
+        let identity = NodeIdentity {
+            node_id: node_id.to_string(),
+            node_label: node_id.to_string(),
+            hostname: format!("{node_id}.test"),
+            os: "test".to_string(),
+            kernel_version: None,
+            cpu_model: None,
+            cpu_cores: 1,
+            agent_version: "0.1.0-test".to_string(),
+            boot_time: None,
+            tags: Vec::new(),
+        };
+        let Ok(authorized) = self.registry.authorize(&identity, token).await else {
+            return false;
+        };
+        self.registry
+            .is_token_current(node_id, authorized.generation)
+            .await
     }
 
-    pub async fn shutdown(mut self) -> Result<()> {
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
-        }
+    pub async fn shutdown(self) -> Result<()> {
+        self.shutdown.cancel();
         let result = self
             .server_handle
             .await
@@ -314,6 +332,12 @@ impl TestServer {
         result.map_err(|error| anyhow!("server task: {error}"))?;
         let _ = tokio::fs::remove_dir_all(&self.temp_dir).await;
         Ok(())
+    }
+
+    /// 触发关停信号但不等待 server 退出,留给测试自行 await `server_handle`
+    /// 之外的步骤(例如观察 agent 是否收到 Close 帧)。
+    pub fn cancel_shutdown(&self) {
+        self.shutdown.cancel();
     }
 
     async fn fetch_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
@@ -394,6 +418,41 @@ impl TestAgent {
             .close(None)
             .await
             .context("close fake agent socket")
+    }
+
+    /// 等服务端主动断开,返回 close code 与 reason 文本。
+    /// 用于覆盖优雅停机:服务端应当在收到 SIGTERM/cancel 后主动发 Close(1001)
+    /// 而不是直接 drop TCP 连接。
+    pub async fn wait_for_close_frame(
+        &mut self,
+        timeout_duration: Duration,
+    ) -> Result<(u16, String)> {
+        timeout(timeout_duration, async {
+            loop {
+                let Some(frame) = self.socket.next().await else {
+                    bail!("socket closed without a Close frame");
+                };
+                match frame.context("receive websocket frame")? {
+                    Message::Close(Some(close_frame)) => {
+                        return Ok((u16::from(close_frame.code), close_frame.reason.to_string()));
+                    }
+                    Message::Close(None) => {
+                        bail!("server closed the socket without a CloseFrame payload");
+                    }
+                    Message::Ping(payload) => {
+                        self.socket
+                            .send(Message::Pong(payload))
+                            .await
+                            .context("reply websocket ping while awaiting close")?;
+                    }
+                    // 服务端在 close 之前可能正在跑别的循环(比如下发刚收到的 ping),
+                    // 这些都吞掉,我们只关心 Close。
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .context("timed out waiting for close frame")?
     }
 
     async fn next_business_message(&mut self, timeout_duration: Duration) -> Result<WireMessage> {

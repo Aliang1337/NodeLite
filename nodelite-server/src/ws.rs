@@ -15,7 +15,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, close_code};
 use axum::extract::{ConnectInfo, State, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
@@ -106,23 +106,32 @@ async fn handle_socket(
 ) -> Result<(), ProtocolError> {
     let shared = state.shared.clone();
     let hello_timeout_secs = shared.config().hello_timeout_secs;
-    let hello = match tokio::time::timeout(
-        Duration::from_secs(hello_timeout_secs),
-        recv_hello(&mut socket),
-    )
-    .await
-    {
-        Ok(Ok(hello)) => hello,
-        Ok(Err(error)) => {
-            state.ws_admission.record_auth_failure(client_ip);
-            return Err(error);
+    let shutdown = state.shutdown.clone();
+
+    // 处于"等 hello"阶段时也要响应进程级关停:握手未完成的连接如果不在这里
+    // 主动断开,后续 axum graceful shutdown 期间它们会拖住整个进程退出。
+    let hello = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => {
+            let _ = send_close_frame(&mut socket, close_code::AWAY, "server shutting down").await;
+            return Ok(());
         }
-        Err(_) => {
-            state.ws_admission.record_auth_failure(client_ip);
-            return Err(ProtocolError::Client(
-                "timed out waiting for hello message".to_string(),
-            ));
-        }
+        outcome = tokio::time::timeout(
+            Duration::from_secs(hello_timeout_secs),
+            recv_hello(&mut socket),
+        ) => match outcome {
+            Ok(Ok(hello)) => hello,
+            Ok(Err(error)) => {
+                state.ws_admission.record_auth_failure(client_ip);
+                return Err(error);
+            }
+            Err(_) => {
+                state.ws_admission.record_auth_failure(client_ip);
+                return Err(ProtocolError::Client(
+                    "timed out waiting for hello message".to_string(),
+                ));
+            }
+        },
     };
     if hello.protocol_version != WIRE_PROTOCOL_VERSION {
         state.ws_admission.record_auth_failure(client_ip);
@@ -140,12 +149,12 @@ async fn handle_socket(
         )));
     }
     let mut session_token = hello.token.clone();
-    let identity = match state
+    let authorized = match state
         .registry
         .authorize(&hello.identity, &session_token)
         .await
     {
-        Ok(identity) => identity,
+        Ok(authorized) => authorized,
         Err(error) => {
             warn!(
                 client_ip = %client_ip,
@@ -178,6 +187,10 @@ async fn handle_socket(
     };
     state.ws_admission.clear_auth_failures(client_ip);
 
+    let identity = authorized.identity;
+    // 捕获 hello 时刻的 token 代次; 之后所有 `is_token_current` 调用都比对这个值,
+    // 一旦操作员轮换 token, 代次就会 +1, 当前会话会被立刻断开。
+    let mut session_generation = authorized.generation;
     let node_id = identity.node_id.clone();
     let node_label = identity.node_label.clone();
     let session_id = shared
@@ -213,6 +226,17 @@ async fn handle_socket(
 
         loop {
             tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    info!(node_id = %node_id, session_id, "closing websocket session due to server shutdown");
+                    let _ = sender
+                        .send(Message::Close(Some(CloseFrame {
+                            code: close_code::AWAY,
+                            reason: "server shutting down".into(),
+                        })))
+                        .await;
+                    break Ok(());
+                }
                 incoming = receiver.next() => {
                     let Some(frame) = incoming else {
                         break Ok(());
@@ -224,7 +248,7 @@ async fn handle_socket(
                         ParsedFrame::Control => continue,
                         ParsedFrame::Wire(message) => match *message {
                             WireMessage::Metrics(MetricsMessage { snapshot }) => {
-                                if !state.registry.is_token_current(&node_id, &session_token).await {
+                                if !state.registry.is_token_current(&node_id, session_generation).await {
                                     warn!(node_id = %node_id, "disconnecting session after registry token change");
                                     break Ok(());
                                 }
@@ -260,7 +284,7 @@ async fn handle_socket(
                                 state.history.record_status(&status).await;
                             }
                             WireMessage::AgentLogs(AgentLogsMessage { entries }) => {
-                                if !state.registry.is_token_current(&node_id, &session_token).await {
+                                if !state.registry.is_token_current(&node_id, session_generation).await {
                                     warn!(node_id = %node_id, "disconnecting session after registry token change");
                                     break Ok(());
                                 }
@@ -270,7 +294,7 @@ async fn handle_socket(
                                 }
                             }
                             WireMessage::Pong(PongMessage { nonce }) => {
-                                if !state.registry.is_token_current(&node_id, &session_token).await {
+                                if !state.registry.is_token_current(&node_id, session_generation).await {
                                     warn!(node_id = %node_id, "disconnecting session after registry token change");
                                     break Ok(());
                                 }
@@ -293,7 +317,7 @@ async fn handle_socket(
                                 break Err(ProtocolError::Client("agent must not send server_notice messages".to_string()));
                             }
                             WireMessage::RefreshTokenRequest(request) => {
-                                if !state.registry.is_token_current(&node_id, &session_token).await {
+                                if !state.registry.is_token_current(&node_id, session_generation).await {
                                     warn!(node_id = %node_id, "disconnecting session after token expiry before refresh");
                                     break Ok(());
                                 }
@@ -313,7 +337,7 @@ async fn handle_socket(
                                     );
                                 }
                                 match state.registry.refresh_token(&node_id).await {
-                                    Ok((new_token, expires_at)) => {
+                                    Ok((new_token, expires_at, new_generation)) => {
                                         let response = WireMessage::RefreshTokenResponse(
                                             nodelite_proto::RefreshTokenResponseMessage {
                                                 new_token: new_token.clone(),
@@ -322,7 +346,7 @@ async fn handle_socket(
                                         );
                                         let payload = serde_json::to_string(&response)
                                             .map_err(|error| anyhow!("failed to serialize refresh response: {error}"))?;
-                                        // 先发送、再替换本地 session_token。理由同
+                                        // 先发送、再替换本地 session_token + generation。理由同
                                         // `maybe_refresh_agent_token`:send 失败时不能
                                         // 让 server 进入一个 agent 看不到的新状态。
                                         sender
@@ -330,6 +354,7 @@ async fn handle_socket(
                                             .await
                                             .map_err(|error| anyhow!("failed to send refresh response: {error}"))?;
                                         session_token = new_token;
+                                        session_generation = new_generation;
                                         info!(node_id = %node_id, "token refreshed successfully");
                                     }
                                     Err(error) => {
@@ -364,6 +389,7 @@ async fn handle_socket(
                                 &state.registry,
                                 &node_id,
                                 &mut session_token,
+                                &mut session_generation,
                                 "manual",
                             )
                             .await
@@ -387,7 +413,7 @@ async fn handle_socket(
                         warn!(node_id = %node_id, session_id, "closing superseded websocket session");
                         break Ok(());
                     }
-                    if !state.registry.is_token_current(&node_id, &session_token).await {
+                    if !state.registry.is_token_current(&node_id, session_generation).await {
                         warn!(node_id = %node_id, "closing websocket session after registry token change");
                         break Ok(());
                     }
@@ -397,6 +423,7 @@ async fn handle_socket(
                             &state.registry,
                             &node_id,
                             &mut session_token,
+                            &mut session_generation,
                             "pre-expiry",
                         )
                         .await?;
@@ -443,13 +470,15 @@ async fn refresh_session_token(
     registry: &NodeRegistry,
     node_id: &str,
     session_token: &mut String,
+    session_generation: &mut u64,
     trigger: &str,
 ) -> Result<DateTime<Utc>> {
-    let (new_token, expires_at) = registry.refresh_token(node_id).await?;
+    let (new_token, expires_at, new_generation) = registry.refresh_token(node_id).await?;
     info!(
         node_id = %node_id,
         trigger,
         expires_at = %expires_at.to_rfc3339(),
+        generation = new_generation,
         "refreshed agent token",
     );
     let response = WireMessage::RefreshTokenResponse(nodelite_proto::RefreshTokenResponseMessage {
@@ -463,6 +492,7 @@ async fn refresh_session_token(
         .await
         .map_err(|error| anyhow!("failed to send token refresh response: {error}"))?;
     *session_token = new_token;
+    *session_generation = new_generation;
     Ok(expires_at)
 }
 
@@ -528,8 +558,29 @@ async fn send_wire_message(
     Ok(())
 }
 
+/// 主动断开未完成握手的连接:给客户端一个明确的 close code,
+/// 而不是直接 drop socket(会被 agent 当成网络异常并立即重连)。
+async fn send_close_frame(
+    socket: &mut WebSocket,
+    code: u16,
+    reason: &'static str,
+) -> Result<(), anyhow::Error> {
+    socket
+        .send(Message::Close(Some(CloseFrame {
+            code,
+            reason: reason.into(),
+        })))
+        .await
+        .map_err(|error| anyhow!("failed to send close frame: {error}"))?;
+    Ok(())
+}
+
 /// 清理"过期或过多"的 Ping 记录,避免在 Agent 异常时无限制堆积。
-fn prune_outstanding_pings(outstanding_pings: &mut HashMap<u64, Instant>, max_age: Duration, max_outstanding_pings: usize) {
+fn prune_outstanding_pings(
+    outstanding_pings: &mut HashMap<u64, Instant>,
+    max_age: Duration,
+    max_outstanding_pings: usize,
+) {
     outstanding_pings.retain(|_, sent_at| sent_at.elapsed() < max_age);
 
     if outstanding_pings.len() < max_outstanding_pings {
