@@ -22,9 +22,53 @@ env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  validate:
+    # 先对将要发布的 tag 做完整校验;任何失败都会阻止后续 release。
+    name: Validate release tag
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+
+      - name: Set up Rust
+        # 发布前和 CI 一样要求 rustfmt / clippy 都通过。
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add clippy rustfmt
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-validate
+          workspaces: |
+            . -> target
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+      - name: Shellcheck installers
+        run: shellcheck scripts/install-server.sh scripts/install-agent.sh
+
   build:
     # 针对 x86_64 / aarch64 两个 musl 目标分别构建。
     name: Build ${{ matrix.target }}
+    needs: validate
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
