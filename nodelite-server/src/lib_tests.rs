@@ -16,8 +16,8 @@ use tokio_util::sync::CancellationToken;
 use tower::util::ServiceExt;
 
 use super::{
-    AppState, PROTECTED_CACHE_CONTROL, PROTECTED_CONTENT_SECURITY_POLICY, ServerReadiness,
-    set_protected_response_headers, uses_insecure_remote_public_base_url,
+    AppState, PROTECTED_CACHE_CONTROL, ServerReadiness, set_protected_response_headers,
+    uses_insecure_remote_public_base_url,
 };
 use crate::admission::{
     InstallAdmissionConfig, InstallAdmissionController, WsAdmissionController, WsAdmissionError,
@@ -39,6 +39,7 @@ use crate::sanitize::{
     update_metric_anomaly_window,
 };
 use crate::state::SharedState;
+use crate::ui::index_page_csp;
 use crate::ws::ws_handler;
 use axum::routing::get;
 use nodelite_proto::{NodeSnapshot, ServerConfig, WsConfig};
@@ -477,9 +478,7 @@ fn protected_routes_attach_security_headers() {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(header::CONTENT_SECURITY_POLICY),
-            Some(&header::HeaderValue::from_static(
-                PROTECTED_CONTENT_SECURITY_POLICY,
-            )),
+            Some(&header::HeaderValue::from_static(index_page_csp(),)),
         );
         assert_eq!(
             response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
