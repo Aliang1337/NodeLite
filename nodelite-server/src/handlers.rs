@@ -493,33 +493,22 @@ fn install_blocked_response(retry_after_secs: u64) -> Response {
 }
 
 const INSTALL_TOKEN_HEX_LEN: usize = 64;
-const INSTALL_TOKEN_MIN_UNIQUE_NIBBLES: u32 = 10;
 
 /// install token 在 [registry.rs](../registry.rs) 中由 `generate_token` 生成,
 /// 固定为 32 字节随机数的 lowercase hex。这里的廉价检查会在文件锁前拒绝
-/// 明显无效或低熵的输入。
+/// 明显无效的输入。
 pub(crate) fn is_well_formed_install_token(token: &str) -> bool {
     if token.len() != INSTALL_TOKEN_HEX_LEN {
         return false;
     }
 
-    let mut seen_nibbles = 0_u16;
     for byte in token.bytes() {
-        let Some(nibble) = lowercase_hex_nibble(byte) else {
+        if !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase() {
             return false;
-        };
-        seen_nibbles |= 1 << nibble;
+        }
     }
 
-    seen_nibbles.count_ones() >= INSTALL_TOKEN_MIN_UNIQUE_NIBBLES
-}
-
-fn lowercase_hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        _ => None,
-    }
+    true
 }
 
 /// 仪表盘顶部的总览数据。
