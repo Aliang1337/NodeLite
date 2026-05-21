@@ -61,6 +61,7 @@ pub(crate) fn test_server_config(
         listen,
         public_base_url,
         insecure_allow_http: false,
+        trusted_proxies: Vec::new(),
         readonly_auth: Some(ReadonlyAuthConfig {
             username: "viewer".to_string(),
             password: "secret".to_string(),
