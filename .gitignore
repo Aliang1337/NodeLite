@@ -10,3 +10,6 @@ target/tarpaulin/
 SECURITY.md
 
 .claude/
+
+# Maestro workflow 本地分析日志(hook 自动追加,含命令片段,不应入库)
+.workflow/spec-analytics.jsonl
