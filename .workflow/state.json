@@ -6,11 +6,20 @@
   "current_task_id": null,
   "milestones": [],
   "artifacts": [],
-  "last_updated": "2026-05-21T08:54:38Z",
+  "last_updated": "2026-05-21T09:02:28Z",
   "accumulated_context": {
     "key_decisions": [],
     "blockers": [],
-    "deferred": []
+    "deferred": [],
+    "quick_tasks": [
+      {
+        "id": "quick-fix-ultrawide-display-half-width-2026-05-21",
+        "description": "修复带鱼屏显示器界面展示一半的问题",
+        "completed_at": "2026-05-21T09:02:28Z",
+        "directory": ".workflow/scratch/quick-fix-ultrawide-display-half-width-2026-05-21",
+        "verified": "skipped"
+      }
+    ]
   },
   "transition_history": [],
   "milestone_history": []

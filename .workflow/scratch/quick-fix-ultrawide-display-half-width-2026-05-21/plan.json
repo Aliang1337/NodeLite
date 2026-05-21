@@ -1,0 +1,38 @@
+{
+  "id": "plan-quick-fix-ultrawide-2026-05-21",
+  "quick_id": "quick-fix-ultrawide-display-half-width-2026-05-21",
+  "title": "修复带鱼屏显示器界面展示一半的问题",
+  "summary": "Web UI 主容器 `.main` 设置 `max-width: 1680px; width: 100%;` 但未居中，且无超宽屏断点；在 21:9/32:9 带鱼屏下被左对齐到 sidebar 右侧，导致右半屏大量空白。修复：让 .main 在 grid cell 内居中，并新增 1920px/2560px 响应式断点放大 max-width，使超宽屏能合理利用水平空间。",
+  "root_cause": {
+    "file": "nodelite-server/assets/index.html",
+    "lines": "171-175",
+    "issue": ".main { max-width: 1680px; width: 100%; } 缺少 margin: 0 auto 居中，且无超宽屏断点",
+    "also_affects": "nodelite-server/assets/node.html 171-175 同样规则"
+  },
+  "tasks": [
+    {
+      "id": "TASK-001",
+      "title": "为 .main 增加居中与超宽屏响应式断点",
+      "files": [
+        "nodelite-server/assets/index.html",
+        "nodelite-server/assets/node.html"
+      ],
+      "action": "edit",
+      "convergence": {
+        "criteria": [
+          "index.html 与 node.html 的 .main 选择器均设置 margin-left: auto; margin-right: auto;",
+          "在 @media (min-width: 1920px) 时 .main { max-width: 2200px; }",
+          "在 @media (min-width: 2560px) 时 .main { max-width: 2400px; }",
+          "保留原 max-width: 1680px 作为默认值，向下兼容现有桌面尺寸",
+          "无新增 JS 改动，仅 CSS 修改"
+        ]
+      },
+      "implementation": "1) index.html L171-175 修改 .main 增加 margin: 0 auto，并在 @media 响应式区块末尾追加 ≥1920px、≥2560px 断点。2) node.html 同步相同改动。3) 现有的 max-width: 720/900/1280/1320 断点保持不变。"
+    }
+  ],
+  "constraints": [
+    "不破坏 < 1680px 桌面与 < 1320px 双列、< 900px 平板、< 720px 移动断点",
+    "不引入 JS / 不引入新依赖",
+    "保持 CSP 静态 inline style 模型不变（不外提样式文件）"
+  ]
+}

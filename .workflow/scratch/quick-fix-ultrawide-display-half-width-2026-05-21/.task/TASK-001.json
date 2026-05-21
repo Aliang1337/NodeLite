@@ -1,0 +1,30 @@
+{
+  "id": "TASK-001",
+  "quick_id": "quick-fix-ultrawide-display-half-width-2026-05-21",
+  "title": "为 .main 增加居中与超宽屏响应式断点",
+  "status": "pending",
+  "files": [
+    {
+      "path": "nodelite-server/assets/index.html",
+      "anchor": ".main { padding: 24px clamp(20px, 3vw, 36px) 40px; max-width: 1680px; width: 100%; }",
+      "anchor_line_range": "171-175"
+    },
+    {
+      "path": "nodelite-server/assets/node.html",
+      "anchor": ".main { padding: 22px clamp(20px, 3vw, 36px) 40px; max-width: 1680px; width: 100%; }",
+      "anchor_line_range": "171-175"
+    }
+  ],
+  "action": "为 .main 选择器加入 margin: 0 auto（居中于 grid cell），并新增 @media (min-width: 1920px) 与 @media (min-width: 2560px) 断点，使带鱼屏能充分利用水平空间。",
+  "convergence": {
+    "criteria": [
+      "index.html .main 规则末尾包含 margin-left: auto; margin-right: auto;",
+      "node.html .main 规则末尾包含 margin-left: auto; margin-right: auto;",
+      "两文件都新增 @media (min-width: 1920px) { .main { max-width: 2200px; } }",
+      "两文件都新增 @media (min-width: 2560px) { .main { max-width: 2400px; } }",
+      "现有 max-width: 1320/900/720 断点未被破坏",
+      "grep '.main {' 两文件仍只匹配一次（无重复定义）"
+    ]
+  },
+  "implementation": "用 Edit 工具精确替换 .main 选择器内的属性集；用 Edit 在每个文件的最后一处 @media 之后追加新断点；不修改其它 CSS 与 HTML 结构。"
+}

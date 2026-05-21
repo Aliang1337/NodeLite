@@ -172,6 +172,9 @@
         padding: 24px clamp(20px, 3vw, 36px) 40px;
         max-width: 1680px;
         width: 100%;
+        /* 在 grid cell 内居中,避免带鱼屏(21:9 / 32:9)下被左对齐到 sidebar 旁边 */
+        margin-left: auto;
+        margin-right: auto;
       }
       .page-header {
         display: flex;
@@ -809,6 +812,16 @@
         .update-console-head { align-items: start; }
         .update-console-actions { flex-wrap: wrap; justify-content: flex-end; }
         .update-console-body { margin: 0 14px 14px; min-height: 240px; }
+      }
+
+      /* ---------- 超宽屏 / 带鱼屏适配 ---------- */
+      /* 21:9 (~2560x1080) 及更高端常见带鱼屏: 放宽 .main 上限,充分利用水平空间 */
+      @media (min-width: 1920px) {
+        .main { max-width: 2200px; }
+      }
+      /* 32:9 (~3840x1080 / 5120x1440) 等超宽屏: 进一步放宽,但保留外边距留白避免内容贴边 */
+      @media (min-width: 2560px) {
+        .main { max-width: 2400px; }
       }
     </style>
   </head>
