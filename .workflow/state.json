@@ -1,0 +1,17 @@
+{
+  "version": "2.0",
+  "project_name": "NodeLite",
+  "status": "idle",
+  "current_milestone": null,
+  "current_task_id": null,
+  "milestones": [],
+  "artifacts": [],
+  "last_updated": "2026-05-21T08:54:38Z",
+  "accumulated_context": {
+    "key_decisions": [],
+    "blockers": [],
+    "deferred": []
+  },
+  "transition_history": [],
+  "milestone_history": []
+}
